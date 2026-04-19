@@ -1,13 +1,15 @@
-"""Poll a checkpoint file; whenever it changes, run small eval vs starter
-and lb-928, append row to CSV. Non-blocking relative to the training run.
+"""Poll a checkpoint file; whenever it changes, run an eval that MIRRORS the
+training matchup distribution (80% 2P / 20% 4P, non-learner seats 50% lb928 /
+50% starter). Append one row per eval pass to CSV.
 
-Tolerates mid-write races (torch.load failures → sleep + retry).
+The `me` seat is always seat 0. Other seats are independently rolled.
 
 Usage:
-  python training/eval_watcher.py --ckpt training/checkpoints/a2c_v1.pt \
-      --interval 600 --n-games 10 --out .a2c_eval_watch.csv
+  python training/eval_watcher.py --ckpt training/checkpoints/impala_v4.pt \
+      --interval 120 --n-games 10 \
+      --four-player-prob 0.2 --lb928-prob 0.5 \
+      --out .impala_v4_eval_watch.csv
 """
-
 from __future__ import annotations
 
 import argparse
@@ -15,47 +17,53 @@ import csv
 import datetime
 import os
 import pathlib
+import random
 import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from kaggle_environments import make
-from training.agent import load_agent
+from training.agent_v4 import load_agent
 from training.lb928_agent import agent as lb928_agent
 from kaggle_environments.envs.orbit_wars.orbit_wars import starter_agent
 
 
-def play(me, opp, n: int, seats_both: bool = True) -> dict:
+def pick_matchup(four_player_prob: float, lb928_prob: float) -> tuple[int, list[str]]:
+    n_players = 4 if random.random() < four_player_prob else 2
+    types = ["me"]
+    for _ in range(n_players - 1):
+        types.append("lb928" if random.random() < lb928_prob else "starter")
+    return n_players, types
+
+
+def play_one(me, n_players: int, seat_types: list[str]) -> dict:
     env = make("orbit_wars", debug=False)
-    wins = 0; losses = 0; draws = 0
-    for i in range(n):
-        if seats_both and i % 2 == 1:
-            first, second = opp, me
-            swapped = True
+    env.reset(num_agents=n_players)
+    agents = []
+    for t in seat_types:
+        if t == "me":
+            agents.append(me)
+        elif t == "lb928":
+            agents.append(lb928_agent)
         else:
-            first, second = me, opp
-            swapped = False
-        env.reset()
-        env.run([first, second])
-        final = env.steps[-1]
-        r0, r1 = final[0].reward or 0, final[1].reward or 0
-        if swapped:
-            r0, r1 = r1, r0
-        if r0 > r1: wins += 1
-        elif r1 > r0: losses += 1
-        else: draws += 1
-    total = wins + losses + draws
-    return {"wins": wins, "losses": losses, "draws": draws,
-            "win_rate": wins / total if total else 0.0}
+            agents.append(starter_agent)
+    env.run(agents)
+    final = env.steps[-1]
+    rewards = [final[s].reward or 0 for s in range(n_players)]
+    max_r = max(rewards)
+    my_r = rewards[0]
+    won = (my_r == max_r) and (rewards.count(max_r) == 1 or my_r > 0)
+    has_lb928 = any(t == "lb928" for t in seat_types)
+    return {"won": bool(won), "has_lb928": has_lb928,
+            "my_reward": my_r, "max_reward": max_r}
 
 
 def safe_load_agent(ckpt_path: str, retries: int = 5, delay: float = 2.0):
-    """Load a checkpoint, retrying if the file is being written."""
     for i in range(retries):
         try:
             return load_agent(ckpt_path, device="cpu", temperature=0.0)
-        except Exception as e:
+        except Exception:
             if i == retries - 1:
                 raise
             time.sleep(delay)
@@ -65,26 +73,27 @@ def safe_load_agent(ckpt_path: str, retries: int = 5, delay: float = 2.0):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--interval", type=int, default=600,
-                    help="Seconds between checks (default 600)")
+    ap.add_argument("--interval", type=int, default=600)
     ap.add_argument("--n-games", type=int, default=10)
-    ap.add_argument("--out", default=".a2c_eval_watch.csv")
-    ap.add_argument("--starter", action="store_true", default=True)
-    ap.add_argument("--lb928", action="store_true", default=True)
+    ap.add_argument("--four-player-prob", type=float, default=0.2)
+    ap.add_argument("--lb928-prob", type=float, default=0.5)
+    ap.add_argument("--out", default=".eval_watch.csv")
     args = ap.parse_args()
 
     ckpt_path = pathlib.Path(args.ckpt).resolve()
     out_path = pathlib.Path(args.out).resolve()
 
-    fields = ["ts", "ckpt_mtime", "vs_starter_wins", "vs_starter_losses",
-              "vs_starter_wr", "vs_lb928_wins", "vs_lb928_losses",
-              "vs_lb928_wr", "wall_s"]
+    fields = ["ts", "ckpt_mtime", "n_games", "overall_wins", "overall_wr",
+              "vs_lb928_games", "vs_lb928_wins", "vs_lb928_share",
+              "vs_starter_games", "vs_starter_wins", "vs_starter_share",
+              "wall_s"]
     if not out_path.exists():
         with out_path.open("w", newline="") as f:
             csv.DictWriter(f, fieldnames=fields).writeheader()
 
     last_mtime = 0.0
-    print(f"watching {ckpt_path}  interval={args.interval}s  N={args.n_games}",
+    print(f"watching {ckpt_path}  interval={args.interval}s  N={args.n_games}  "
+          f"fpp={args.four_player_prob} lb={args.lb928_prob}",
           flush=True)
     while True:
         try:
@@ -96,8 +105,7 @@ def main() -> int:
             continue
         t0 = time.time()
         print(f"[{datetime.datetime.now().isoformat(timespec='seconds')}] "
-              f"checkpoint updated ({mtime - last_mtime:.0f}s since last) — "
-              f"evaluating …", flush=True)
+              f"checkpoint updated — evaluating …", flush=True)
         try:
             me = safe_load_agent(str(ckpt_path))
         except Exception as e:
@@ -105,27 +113,48 @@ def main() -> int:
             time.sleep(60)
             continue
 
-        res_starter = play(me, starter_agent, args.n_games)
-        res_lb = play(me, lb928_agent, args.n_games) if args.lb928 else {
-            "wins": 0, "losses": 0, "draws": 0, "win_rate": 0}
+        overall_wins = 0
+        vs_lb_games = vs_lb_wins = 0
+        vs_st_games = vs_st_wins = 0
+        for _ in range(args.n_games):
+            n, types = pick_matchup(args.four_player_prob, args.lb928_prob)
+            r = play_one(me, n, types)
+            if r["won"]:
+                overall_wins += 1
+            if r["has_lb928"]:
+                vs_lb_games += 1
+                if r["won"]:
+                    vs_lb_wins += 1
+            else:
+                vs_st_games += 1
+                if r["won"]:
+                    vs_st_wins += 1
+
+        overall_wr = overall_wins / args.n_games
+        vs_lb_share = vs_lb_wins / vs_lb_games if vs_lb_games else 0.0
+        vs_st_share = vs_st_wins / vs_st_games if vs_st_games else 0.0
+        wall_s = round(time.time() - t0, 1)
 
         row = {
             "ts": datetime.datetime.now().isoformat(timespec="seconds"),
             "ckpt_mtime": int(mtime),
-            "vs_starter_wins": res_starter["wins"],
-            "vs_starter_losses": res_starter["losses"],
-            "vs_starter_wr": round(res_starter["win_rate"], 3),
-            "vs_lb928_wins": res_lb["wins"],
-            "vs_lb928_losses": res_lb["losses"],
-            "vs_lb928_wr": round(res_lb["win_rate"], 3),
-            "wall_s": round(time.time() - t0, 1),
+            "n_games": args.n_games,
+            "overall_wins": overall_wins,
+            "overall_wr": round(overall_wr, 3),
+            "vs_lb928_games": vs_lb_games,
+            "vs_lb928_wins": vs_lb_wins,
+            "vs_lb928_share": round(vs_lb_share, 3),
+            "vs_starter_games": vs_st_games,
+            "vs_starter_wins": vs_st_wins,
+            "vs_starter_share": round(vs_st_share, 3),
+            "wall_s": wall_s,
         }
         with out_path.open("a", newline="") as f:
             csv.DictWriter(f, fieldnames=fields).writerow(row)
-        print(f"  vs starter: {res_starter['wins']}W/{res_starter['losses']}L "
-              f"({res_starter['win_rate']:.0%})  "
-              f"vs lb928: {res_lb['wins']}W/{res_lb['losses']}L "
-              f"({res_lb['win_rate']:.0%})  [{row['wall_s']}s]",
+        print(f"  overall: {overall_wins}/{args.n_games} ({overall_wr:.0%})  "
+              f"vs_lb928: {vs_lb_wins}/{vs_lb_games} ({vs_lb_share:.0%})  "
+              f"vs_starter: {vs_st_wins}/{vs_st_games} ({vs_st_share:.0%})  "
+              f"[{wall_s}s]",
               flush=True)
         last_mtime = mtime
         time.sleep(args.interval)

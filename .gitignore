@@ -41,6 +41,19 @@ submission/*/model.pt
 # Tracking (submission monitoring)
 tracking/
 
+# Offline RL dataset + scheduler state
+offline/
+.offline_awac_run.log
+.offline_test.log
+.offline_scheduler.log
+.offline_scheduler.pid
+.offline_scheduler.stdout
+.offline_scheduler.lock/
+.offline_nightly.log
+
+# Claude Code local
+.claude/
+
 # Python
 __pycache__/
 *.pyc
