@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orbit Wars — Lux-S1-flavoured self-play (method)</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       max-width:900px;margin:2em auto;color:#222;line-height:1.55;padding:0 1em}
+  h1{border-bottom:2px solid #333;padding-bottom:.3em}
+  h2{background:#eef;padding:.4em .8em;margin-top:2em;border-left:4px solid #339}
+  h3{margin-top:1.5em;color:#224}
+  code{background:#f4f4f4;padding:2px 5px;border-radius:3px;font-size:0.9em}
+  pre{background:#f4f4f4;padding:.8em;border-radius:5px;overflow-x:auto;
+      font-size:0.88em;line-height:1.3}
+  table{border-collapse:collapse;margin:1em 0;width:100%}
+  th,td{border:1px solid #aaa;padding:.4em .8em;text-align:left;vertical-align:top}
+  th{background:#eee}
+  .keep{background:#dfd}
+  .drop{background:#fdd}
+  .adapt{background:#ffd}
+  .note{background:#fff3cd;padding:.6em;border-left:3px solid #c90;margin:1em 0}
+  .math{background:#f0f4f8;padding:.6em;border-radius:5px;font-family:monospace;
+        font-size:0.92em;margin:.5em 0}
+</style>
+</head>
+<body>
+
+<h1>Orbit Wars — Lux-S1-Flavoured Self-Play Training</h1>
+<p><em>Method note for the <code>impala_v1_2026-04-19</code> run. Written
+2026-04-19 during training.</em></p>
+
+<h2>1. The Problem</h2>
+<p><a href="https://www.kaggle.com/competitions/orbit-wars">Kaggle's Orbit Wars
+Featured Simulation Competition</a> is a 2-or-4 player RTS on a 100×100
+continuous board with a sun at the centre. Each turn, every player issues a
+list of moves: <code>[source_planet_id, angle_radians, num_ships]</code>.
+Planets produce ships, rotate around the sun (inner) or stay static (outer).
+Fleets travel in straight lines; crossing the sun destroys them. Combat is
+resolved by the largest attacking force minus the second-largest. The winner
+is whoever has the most ships (on planets + in fleets) after 500 turns, or
+the last survivor.</p>
+
+<p>Important structural facts:</p>
+<ul>
+  <li><strong>Perfect information</strong> — every player sees planets and
+      fleets of every other player.</li>
+  <li><strong>Simultaneous moves</strong> — all players submit actions at
+      once per turn; there is no turn order.</li>
+  <li><strong>Variable action space</strong> — each turn you emit <em>K</em>
+      moves, one per planet you own, where K changes as you lose/gain
+      planets.</li>
+  <li><strong>Deterministic given seed</strong> — env is fully reproducible.</li>
+  <li><strong>Sparse terminal reward</strong> — ±1 at game end, 0 elsewhere.</li>
+</ul>
+
+<h2>2. Starting Point: <code>bc_v2</code></h2>
+<p>We previously trained a behaviour-cloning (BC) policy on a mixed dataset
+of scraped top-10 Kaggle replays + locally-generated <code>starter</code>
+self-play games. The resulting agent <code>bc_v2</code>:</p>
+<ul>
+  <li>0.9 M-parameter Set-Transformer (permutation-invariant encoder over
+      variable planet and fleet sets).</li>
+  <li>Two policy heads: <code>target_planet ∈ {pass, planet_0, …, planet_N}</code>
+      and <code>ships_bucket ∈ {25 %, 50 %, 75 %, 100 %}</code>.</li>
+  <li>Value head: a scalar V(s) estimate.</li>
+  <li>Local win rate: 95 % vs <code>random</code>, 20 % vs <code>starter</code>,
+      0 % vs the rules-based <code>lb-928</code> planner.</li>
+</ul>
+<p>This run bootstraps from <code>bc_v2</code> and improves the policy via
+online self-play.</p>
+
+<h2>3. The Method — Lux S1 Winner, Adapted</h2>
+<p>We base the design on Pressman et al. (2021), the only deep-RL agent to
+win a Kaggle simulation competition (Lux AI Season 1). Their recipe:</p>
+<ol>
+  <li>IMPALA distributed actor-learner architecture.</li>
+  <li>Policy gradient with V-trace off-policy correction.</li>
+  <li>UPGO (upper-bound policy gradient optimisation).</li>
+  <li>TD-λ value targets.</li>
+  <li>Teacher-KL against a frozen BC network for stability.</li>
+  <li>Dense reward shaping for the first ~20 M steps, then sparse only.</li>
+  <li>Test-time augmentation (180° board rotation).</li>
+  <li>AlphaStar-style self-play league.</li>
+</ol>
+
+<h3>What we keep, adapt, and skip</h3>
+<table>
+<tr><th>Element</th><th>Keep/Adapt/Skip</th><th>Why</th></tr>
+<tr class="adapt"><td>Per-unit/per-planet action factorisation</td><td>✅ Keep</td>
+<td>Our action is a set of moves per owned planet; joint log-prob is the sum
+    across owned planets, same as Lux.</td></tr>
+<tr class="adapt"><td>Reward shaping</td><td>✅ Adapted to Orbit Wars</td>
+<td>Planet-count / production-rate / sun-kill penalty / kill-bonus. Decays
+    linearly to zero over the first 50 iters so terminal ±1 eventually
+    dominates.</td></tr>
+<tr class="adapt"><td>Value head</td><td>✅ Keep, shared encoder</td>
+<td>V(s) trained on <strong>every</strong> seat's terminal reward (winners
+    +1 <em>and</em> losers −1).</td></tr>
+<tr class="drop"><td>Fully-convolutional ResNet backbone</td><td>❌ Skip</td>
+<td>Orbit Wars has no natural grid; we use a Set Transformer over planet and
+    fleet entities instead.</td></tr>
+<tr class="drop"><td>Frozen BC teacher KL</td><td>❌ Skip (coef = 0)</td>
+<td>BC is our <em>starting point</em>, not a ceiling. Anchoring to it would
+    limit the policy from improving past BC quality.</td></tr>
+<tr class="drop"><td>V-trace off-policy correction</td><td>❌ Skip</td>
+<td>Our rollouts are synchronous and on-policy — we train on data generated
+    by the same weights (or nearly so). Importance-sampling ratio ≈ 1.</td></tr>
+<tr class="drop"><td>UPGO</td><td>❌ Skip (for now)</td>
+<td>UPGO needs accurate Q estimates we don't have; we use advantage
+    normalisation + clip as a cheap stabiliser.</td></tr>
+<tr class="drop"><td>TD-λ</td><td>⚠️ Simplified to γ-discounted MC return</td>
+<td>Episodes are short (≤ 500 steps); MC return is a reasonable baseline.</td></tr>
+<tr class="drop"><td>IMPALA async actor-learner</td><td>❌ Sync multiprocessing
+    instead</td><td>Four workers generate trajectories concurrently; master
+    updates once per iter. Simpler, no replay buffer, no lag.</td></tr>
+<tr class="drop"><td>180° TTA</td><td>❌ Not yet</td>
+<td>Free 2× data via centre-symmetry; worth adding if we need more signal.</td></tr>
+</table>
+
+<h2>4. Observation and Action Encoding</h2>
+<p>Observation is a tuple <code>(planets, fleets, globals)</code>:</p>
+<ul>
+  <li><strong>planets</strong> [N, 14]: owner one-hot, normalised position, radius,
+      log ships, production one-hot, is-static, is-comet.</li>
+  <li><strong>fleets</strong> [F, 9]: owner, position, sin/cos(angle), log ships,
+      from-planet index, estimated-time-to-impact.</li>
+  <li><strong>globals</strong> [16]: step fraction, angular velocity,
+      remaining-turn fraction, player-slot one-hot, is-4p flag, per-side
+      planet and ship tallies, comet-window indicator, rotation-phase
+      sin/cos.</li>
+</ul>
+
+<p>Architecture: input MLP per entity type + type embedding → 4-layer
+Set-Transformer (d = 128, 4 heads) → per-planet action heads + global-token
+value head. ~ 0.9 M parameters; CPU forward ~ 3–5 ms per sample.</p>
+
+<h2>5. Training Loop (per iter)</h2>
+<pre>for iter in 0 .. 125:
+    broadcast current model weights → 4 workers
+
+    each worker plays one full game:
+        random n_players ∈ {2, 4}
+        every seat uses the SAME current model (pure self-play)
+        every step, every seat's obs is encoded → forward → sampled action
+        env.step([actions[0], actions[1], ...])
+
+    after all 4 games complete:
+        for every seat in every game:
+            compute per-step shaped reward
+            attach terminal reward (±1) to every record of that seat
+            Monte-Carlo discount-sum → shaped return G_shape_t
+            final return = shape_weight · G_shape_t + terminal_reward
+
+    gradient step(s) on combined all-seat batch:
+        advantage = return − V(s);  normalised + clipped to [−2, 2]
+        policy_loss = − E[advantage · log π(action | state)]
+        value_loss  = ½ · E[(V(s) − return)²]
+        entropy_bonus = H(π(·|s)) over the target-planet head
+        loss = policy_loss + 0.5 · value_loss − 0.01 · entropy
+
+    if iter % 10 == 0: save checkpoint
+</pre>
+
+<h3>Reward shaping</h3>
+<div class="math">
+r_shape_t = 0.10 · Δ(my_planet_count)
+          + 0.02 · Δ(my_production_rate)
+          − 0.10 · (my_ships_lost_to_sun) / 100
+          + 0.05 · (enemy_ships_destroyed) / 100
+</div>
+
+<p><strong>Shape weight decays</strong> from 1.0 at iter 0 → 0.0 by iter 50.
+After iter 50 the policy trains purely on the sparse ±1 terminal signal, the
+authentic objective.</p>
+
+<h3>Why all seats feed back</h3>
+<p>This is a key adaptation. Naïve BC-from-winners wastes 50 % of 2p data
+and 75 % of 4p data. Instead, every seat's <code>(obs, action,
+terminal_reward)</code> trains the policy and value networks:</p>
+
+<ul>
+  <li><strong>Winners</strong> (terminal +1, positive advantage):
+      <code>−(+adv) · log π → minimise → push log π up → take this action more</code>.</li>
+  <li><strong>Losers</strong> (terminal −1, negative advantage):
+      <code>−(−adv) · log π → minimise → push log π down → take this action less</code>.</li>
+  <li>Both contribute to value-loss with their own terminal reward as the
+      target, training V(s) to reflect true game outcomes.</li>
+</ul>
+
+<p>The gradient signs are automatic once advantages are computed correctly;
+we do not need to split winners from losers explicitly.</p>
+
+<h2>6. Why Not MCTS (Mode B)?</h2>
+<p>We explored an AlphaZero-flavoured run with Sampled MCTS earlier
+(<code>alphazero_v1_2026-04-19</code>, killed). Two obstacles:</p>
+<ol>
+  <li><strong>Per-iter cost</strong>: ≥ 10 simulations × 150 tree descents ×
+      4 games = ~ 8 minutes per iter on CPU. A 500-game run would take
+      ~ 16 hours.</li>
+  <li><strong>No RTS winner on Kaggle has ever used inference-time MCTS</strong>.
+      Lux S1 (Pressman 2021), Kore, Halite, Lux S2 winners all deployed
+      policy-only agents. Simultaneous moves + huge variable action spaces
+      make shallow MCTS noisy rather than helpful.</li>
+</ol>
+<p>We keep the option open: if this run plateaus below <code>lb-928</code>,
+we can add tree search at training time as a policy-target refiner (mode A:
+MCTS for data gen, policy-only at inference).</p>
+
+<h2>7. Expected Behaviour</h2>
+<table>
+<tr><th>Phase</th><th>Iters</th><th>What should happen</th></tr>
+<tr><td>Early</td><td>0–20</td>
+<td>Shape weight ~1.0; value loss drops fast (V(s) aligns with shaped
+    returns); policy starts departing from BC prior; entropy rises as
+    advantages push the policy to explore other actions.</td></tr>
+<tr><td>Mid</td><td>20–60</td>
+<td>Shape weight decays; terminal reward takes over; win-rate vs
+    <code>starter</code> should climb past BC's 20 % baseline.</td></tr>
+<tr><td>Late</td><td>60–125</td>
+<td>Pure terminal reward; policy consolidates on strategies that actually
+    win. Value loss should plateau; win rate vs <code>starter</code> targets
+    ≥ 60 %, vs <code>lb-928</code> any non-zero is progress.</td></tr>
+</table>
+
+<h2>8. What Could Still Go Wrong</h2>
+<ul>
+  <li><strong>Policy collapse</strong> — advantages dominated by noise; entropy
+      drops to 0; agent picks one fixed action. Mitigation: entropy coef 0.01
+      + advantage normalisation + clip.</li>
+  <li><strong>Value head chasing shape tail</strong> — when shape_weight → 0,
+      V(s) suddenly has different target scale. Mitigation: shape decay is
+      smooth (linear 50 iters), and terminal reward is always present in
+      the return formula.</li>
+  <li><strong>0.9 M params too small</strong> for the diversity of policies
+      self-play generates. If we plateau well below lb-928, widen to 4 M.</li>
+  <li><strong>Pass-bias inheritance</strong> from bc_v2 — agent only emits
+      one action per turn. Advantage-weighted updates should eventually
+      correct this, but not guaranteed.</li>
+</ul>
+
+<h2>9. Deployment (Mode A)</h2>
+<p>After training we will:</p>
+<ol>
+  <li>Copy final <code>training/checkpoints/impala_v1.pt</code> → submission
+      bundle at <code>submission/az_v1/model.pt</code>.</li>
+  <li>Keep the existing lazy-load <code>main.py</code> (defers torch.load off
+      the first-tick critical path since Kaggle's
+      <code>remainingOverageTime = 2 s</code> absorbs a slow first step).</li>
+  <li>Tar + <code>kaggle competitions submit orbit-wars -f submission.tar.gz</code>.</li>
+  <li>Poll <code>competitions.EpisodeService</code> via
+      <code>scrape_submission.py</code> to track real-world ELO.</li>
+</ol>
+<p>At inference we <strong>do not run MCTS</strong>. One forward pass per
+turn, pick argmax per owned planet, translate back to
+<code>[src, angle, ships]</code> tuples.</p>
+
+<h2>10. Files for this run</h2>
+<pre>experiments/2026-04-19/impala_v1_2026-04-19/
+├── README.md         # config, what this is
+├── method.html       # this document
+├── run.log        →  /home/lab/orbit-war/.impala_run.log
+├── monitor.csv    →  /home/lab/orbit-war/.impala_monitor.csv
+├── eval.csv       →  /home/lab/orbit-war/.impala_eval_watch.csv
+└── model.pt       →  /home/lab/orbit-war/training/checkpoints/impala_v1.pt
+</pre>
+
+<p><em>All RL-framework-adjacent code is hand-rolled (~600 lines total for
+<code>online_impala.py</code> + helpers) — no stable-baselines3, no RLlib, no
+CleanRL as a dependency. CleanRL's PPO loop structure informed the design
+but nothing is imported from it.</em></p>
+
+</body>
+</html>

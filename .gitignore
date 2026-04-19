@@ -1,0 +1,53 @@
+# Scraped / derived data
+simulation/
+trajectories/
+processed/
+
+# Model checkpoints (too big + user-specific)
+training/checkpoints/
+*.pt
+
+# Cron runtime state
+.cron.log
+.cron.lock
+.cron_expiry
+.cron_python
+
+# Scheduler state
+.scheduler.log
+.scheduler.stdout
+.scheduler.pid
+.scheduler.lock
+.first_run.log
+
+# Training run dotfile logs/CSVs
+.alphazero*
+.impala*
+.a2c*
+.selfplay*
+.synth_gen*
+
+# Kaggle artefacts
+orbit-wars.zip
+orbit-wars-kit.tar.gz*
+
+# Vendored upstream library (has its own .git, re-clone if needed)
+kaggle-environments/
+
+# Submission bundles (contain model.pt + tar.gz)
+submission/*/submission.tar.gz
+submission/*/model.pt
+
+# Tracking (submission monitoring)
+tracking/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# WSL NTFS metadata
+*:Zone.Identifier
+
+# Large notebooks with full outputs (keep code-only notebooks)
+notebooks/getting-started.ipynb

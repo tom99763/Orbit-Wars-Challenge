@@ -1,0 +1,721 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orbit Wars — IMPALA-lite Self-Play (v1 &amp; v2 design)</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+       max-width:980px;margin:2em auto;color:#1a1a1a;line-height:1.55;padding:0 1.2em}
+  h1{border-bottom:3px solid #2a4d7a;padding-bottom:.3em;color:#2a4d7a}
+  h2{background:#eaf0f8;padding:.5em 1em;margin-top:2.2em;border-left:5px solid #2a4d7a;
+     color:#1c3b5f}
+  h3{margin-top:1.8em;color:#2a4d7a;border-bottom:1px solid #cdd}
+  h4{margin-top:1.3em;color:#345;font-size:1em}
+  code{background:#f2f4f7;padding:2px 5px;border-radius:3px;font-size:0.93em;
+       font-family:"SFMono-Regular",Consolas,monospace;color:#1b4b7a}
+  pre{background:#f7f7f9;padding:1em;border-radius:6px;overflow-x:auto;
+      font-size:0.88em;line-height:1.4;border-left:3px solid #aab5c4}
+  .math{background:#eef4fa;padding:.7em 1em;border-radius:5px;
+        font-family:"Latin Modern Math","Cambria Math",serif;
+        font-size:1em;margin:.6em 0;line-height:1.7}
+  table{border-collapse:collapse;margin:1em 0;width:100%;font-size:0.94em}
+  th,td{border:1px solid #bbb;padding:.45em .85em;text-align:left;vertical-align:top}
+  th{background:#e5eaf0;color:#1c3b5f}
+  .keep{background:#e7f5e2}
+  .drop{background:#fbe4e0}
+  .adapt{background:#fdf4d7}
+  .note{background:#fff9e0;padding:.75em 1em;border-left:4px solid #d9a400;
+        margin:1em 0;border-radius:0 4px 4px 0}
+  .callout{background:#e5f0fa;padding:.7em 1em;border-left:4px solid #2a6d9a;
+           margin:1em 0;border-radius:0 4px 4px 0}
+  .todo{background:#fee;padding:.5em 1em;border-left:4px solid #a33;margin:.5em 0}
+  ul li, ol li{margin-bottom:.3em}
+  .footer{margin-top:3em;color:#888;font-size:0.88em;border-top:1px solid #ccc;
+          padding-top:1em}
+</style>
+</head>
+<body>
+
+<h1>Orbit Wars: IMPALA-lite Self-Play Design</h1>
+<p><em>Detailed design memo for <code>impala_v1</code> and the planned
+<code>impala_v2</code> runs. For teammates / reviewers. 2026-04-19.</em></p>
+
+<div class="callout">
+<strong>TL;DR.</strong> A Set-Transformer policy with 0.9 M parameters,
+bootstrapped from a behaviour-cloning checkpoint, trained via synchronous
+on-policy actor-critic self-play (four parallel CPU workers). Reward is
+a decaying mix of Orbit-Wars-specific shaped rewards (planet count,
+production rate, sun-kill penalty, enemy kills) and sparse terminal ±1.
+<strong>Every seat</strong> in every game contributes to the gradient
+(winners <em>and</em> losers). <code>v2</code> adds a 50 % probability
+that any non-learner seat plays with the rules-based <code>lb-928</code>
+planner instead of the current policy, to avoid self-play echo chambers.
+</div>
+
+<h2>1. Problem</h2>
+<p>Orbit Wars is a 2-or-4-player RTS on a 100×100 continuous board with a
+sun at the centre. Each turn, every player simultaneously submits a list of
+moves, where each move is
+<code>[source_planet_id, angle_radians, num_ships]</code>. Planets produce
+ships each turn proportional to their radius; inner planets rotate, outer
+ones are static. Fleets travel in straight lines at a speed scaling with
+fleet size; crossing the sun (point-to-segment distance &lt; 10) destroys
+them. Combat on a planet resolves as top-attacker minus second-attacker
+survivors, with ownership flipping if the garrison is overwhelmed. Game
+ends at step 500 or when only one player has planets or fleets remaining.
+Winner is argmax of total ships; reward is ±1 terminally, 0 elsewhere.</p>
+
+<p>Concretely:</p>
+<ul>
+  <li><strong>Perfect information, simultaneous moves, deterministic given seed</strong>.</li>
+  <li><strong>Variable-cardinality state</strong>: ~20–40 planets plus 0–∞
+      fleets, changing across turns.</li>
+  <li><strong>Multi-component action per turn</strong>: one sub-action per
+      owned planet. Joint action space is exponential in the number of
+      owned planets.</li>
+  <li><strong>Hard-limit <code>actTimeout = 1 s</code></strong> per
+      turn (with 2 s bankable overage). Deployment can't run heavy search.</li>
+</ul>
+
+<h2>2. Model: <code>OrbitAgent</code> (0.9 M params, shared policy+value)</h2>
+
+<h3>2.1 Observation encoding</h3>
+<p>Three input streams; each entity becomes a 128-d token.</p>
+
+<h4>Planet features (one row per planet; shape [N, 14])</h4>
+<pre>[0] owner_is_me       one-hot for "I own this planet"
+[1] owner_is_enemy    one-hot for "another player owns this"
+[2] owner_is_neutral  one-hot for "owner == -1"
+[3] x_norm = (x - 50) / 50              board coordinate normalised to [-1, 1]
+[4] y_norm = (y - 50) / 50
+[5] radius                               radius (float)
+[6] log_ships = log1p(ships) / 8         compressed ship count
+[7..11] prod_onehot_1..5                 production rate one-hot ∈ [1, 5]
+[12] is_static                           orbital_r + radius >= 50
+[13] is_comet                            spawned after t=0 (temporary planet)</pre>
+
+<h4>Fleet features (one row per active fleet; shape [F, 9])</h4>
+<pre>[0] owner_is_me
+[1] owner_is_enemy
+[2] x_norm, [3] y_norm
+[4] sin(angle), [5] cos(angle)
+[6] log_ships
+[7] from_planet_idx_norm                 source-planet id normalised
+[8] eta_norm                             crude time-to-edge-of-board / 50</pre>
+
+<h4>Global features (one vector; shape [16])</h4>
+<pre>[0] step / 500
+[1] angular_velocity (radians / turn)
+[2] (500 - step) / 500                   remaining-turn fraction
+[3..6] player_slot one-hot (0..3)
+[7] is_4p
+[8..10] n_my / n_enemy / n_neutral planets, each / 20
+[11..12] log1p(my_total_ships)/8, log1p(enemy_total_ships)/8
+[13] comet_window_active                 step within ±5 of scheduled spawn
+[14..15] sin, cos(angular_velocity * step)   current rotation phase</pre>
+
+<h3>2.2 Architecture</h3>
+<pre>planets [N, 14]  →  MLP + type_embed(0)  →  [N, 128]  (planet tokens)
+fleets  [F, 9]   →  MLP + type_embed(1)  →  [F, 128]  (fleet tokens)
+globals [16]     →  MLP + type_embed(2)  →  [1, 128]  (global token)
+
+        ↓  concatenate: [N + F + 1, 128]
+
+        ┌──────────────────────────────────────────────┐
+        │  4 × Set-Attention Block  (pre-LN MHA + FFN) │
+        │  d_model = 128, n_heads = 4, ff_expansion = 4 │
+        │  permutation-invariant over entity tokens     │
+        └──────────────────────────────────────────────┘
+
+        ↓  planet_tokens: [N, 128]   global_token: [128]
+
+  Policy heads (per planet token):
+    target_q = Linear(planet_token)
+    target_k = Linear([pass_token, planet_tokens])        # [P+1, d]
+    target_logits = q · kᵀ / √d                            # [P, P+1]
+    bucket_logits = Linear(planet_token)                   # [P, 4]
+
+  Value head (on global token):
+    V(s) = MLP( global_token ) → ℝ</pre>
+
+<p>Total parameters ≈ 0.9 M. CPU forward on one sample is 3–5 ms; batch of
+~100 samples is ~20–40 ms.</p>
+
+<h3>2.3 Action factorisation</h3>
+<p>An action at turn <em>t</em> is a set
+<code>a_t = { (src_i, tgt_i, bucket_i) : i ∈ owned_planets_with_ships }</code>.
+For each owned planet <em>i</em>, the policy independently samples:</p>
+<ul>
+  <li><code>tgt_class ∈ {pass, planet_0, …, planet_{P-1}}</code>, where
+      <code>pass</code> (class 0) means "this planet sits still this turn".</li>
+  <li><code>ships_bucket ∈ {25 %, 50 %, 75 %, 100 %}</code> of the garrison.</li>
+</ul>
+<p>Given these, the env move is recovered deterministically:</p>
+<pre>angle     = atan2(target.y - src.y, target.x - src.x)
+num_ships = round(bucket_fraction × src.ships)</pre>
+
+<div class="callout">
+<strong>Why this factorisation?</strong> In our scraped top-10 data, every
+action is effectively a planet-directed shot — nobody aims into empty
+space. Reducing the continuous angle to "which planet are you attacking"
+collapses a continuous decision into a discrete one, saves model capacity,
+and aligns the action prior with actual expert behaviour.
+</div>
+
+<h4>Joint log-probability</h4>
+<p>Because sub-actions are sampled independently per planet, the joint
+log-probability of the full turn's action is the sum over owned planets:</p>
+<div class="math">
+log π(a<sub>t</sub> | s<sub>t</sub>) = Σ<sub>i ∈ owned</sub>
+  [ log π<sub>tgt</sub>(tgt<sub>i</sub> | s<sub>t</sub>, planet<sub>i</sub>)
+  + log π<sub>bkt</sub>(bucket<sub>i</sub> | s<sub>t</sub>, planet<sub>i</sub>) ]
+</div>
+<p>This is what enters the policy-gradient term below.</p>
+
+<h3>2.4 Why one shared encoder (not two separate networks)</h3>
+<p>The name "Actor-Critic" can mislead into thinking we need two networks —
+one to act, one to evaluate. In practice, the actor / critic distinction is
+about <em>roles</em>, not about how they're implemented. Our
+<code>OrbitAgent</code> has <strong>one shared Set-Transformer encoder</strong>
+with three heads: two policy heads (target + bucket) and one value head.
+This is the standard choice in modern deep RL.</p>
+
+<table>
+<tr><th>System</th><th>Architecture</th></tr>
+<tr><td>AlphaGo / AlphaZero (Silver 2017)</td>
+<td>Shared ResNet tower, separate policy and value heads</td></tr>
+<tr><td>Lux AI S1 winner (Pressman 2021)</td>
+<td>Shared ResNet backbone (24 blocks), three actor heads (worker/cart/citytile) + value head</td></tr>
+<tr><td>CleanRL PPO (Huang 2022)</td>
+<td>Shared MLP encoder, two linear heads</td></tr>
+<tr><td>A3C original (Mnih 2016)</td>
+<td>Paper recommends shared backbone in §3</td></tr>
+<tr><td><strong>Our OrbitAgent</strong></td>
+<td>Shared Set-Transformer (4 layers, d=128) + target_q·target_k / bucket_linear / value_mlp</td></tr>
+</table>
+
+<h4>Why share</h4>
+<ul>
+  <li><strong>Sample efficiency</strong>. The state representation the value
+      head needs — "is my side winning right now?" — is built from the same
+      information the policy head needs — "where should I attack?". Sharing
+      lets every gradient update on either head improve the shared
+      representation for both.</li>
+  <li><strong>Compute</strong>. One forward pass yields target, bucket, and
+      value simultaneously. A two-network version doubles forward cost.
+      For a Set-Transformer with 30+ tokens per sample at 3-5 ms CPU
+      inference, doubling matters at the Kaggle <code>actTimeout = 1s</code>.</li>
+  <li><strong>Parameter budget</strong>. 0.9 M shared params are enough for
+      our task. Splitting into two 0.5 M independent networks loses the
+      shared representation with no net parameter gain.</li>
+  <li><strong>Inductive bias</strong>. In Orbit Wars the features that
+      inform "where to attack" (planet ownership, positions, ship counts,
+      rotation phase) are the same features that inform "am I winning";
+      no reason to learn two different representations of them.</li>
+</ul>
+
+<h4>When two networks would be preferred</h4>
+<p>Decoupled PPO (Cobbe, Hilton, Klimov, Schulman, 2021) shows that for some
+continuous-control tasks, the policy-loss gradient and the value-loss
+gradient can conflict in the shared encoder and training diverges; there
+they recommend a separate value network. This has not been reported for
+RTS / board-game domains, and our training signal stays well-behaved in
+our prior runs. If we later observe value-loss stuck high while policy-loss
+improves (or vice versa), splitting is the next thing to try.</p>
+
+<h4>Head summary</h4>
+<pre>planets, fleets, globals → (embeddings + type_embed)
+                         → [N + F + 1, 128]
+                         → 4× SetAttentionBlock
+                         → planet_tokens [N, 128], global_token [128]
+
+  planet_tokens → target_q · target_k([pass_tok, planet_tokens])
+                → target_logits [N, P+1]              # "where to attack per owned planet"
+  planet_tokens → bucket_head linear
+                → bucket_logits [N, 4]                 # "send how many ships"
+  global_token  → value_head MLP
+                → V(s) scalar                           # "am I winning right now?"</pre>
+
+<p>"A2C needs two networks" is an artefact of the original Barto-Sutton
+(1983) tabular formulation, repeated in some pedagogical materials. In any
+deep-RL implementation published after ~2015, the shared-backbone form is
+the standard.</p>
+
+<h3>2.5 Inference-time action masks</h3>
+<p>Only used at <em>deployment</em>, not during BC or RL training (masking at
+training would sometimes reject expert / self-sampled labels and blow up the
+cross-entropy).</p>
+<ul>
+  <li><strong>Sun blocker</strong>: any (src, target) pair whose connecting
+      line segment passes within 10 of the board centre has its
+      <code>target_logits</code> entry set to −10⁹ before softmax.</li>
+  <li><strong>Self-target</strong>: the diagonal is masked (can't shoot your
+      own planet).</li>
+</ul>
+
+<h2>3. Starting Point: <code>bc_v2</code></h2>
+<p>All RL runs bootstrap from <code>bc_v2</code>, a behaviour-cloning checkpoint
+trained on:</p>
+<ul>
+  <li>~500 <code>starter vs {starter, random}</code> locally-generated games,</li>
+  <li>~41 winner trajectories from 50 scraped top-10 Kaggle replays,</li>
+  <li>total ~230 k labelled <code>(obs, action)</code> pairs,</li>
+  <li>30 epochs, best loss 0.099, local win rates: 95 % vs random, 20 %
+      vs starter, 0 % vs <code>lb-928</code>.</li>
+</ul>
+<p>The value head was trained only as an auxiliary regression target during
+BC (it predicts 0 early in the game, close to ±1 near terminal). We take
+both policy and value weights into the RL phase.</p>
+
+<h2>4. Reward Function (the key design choice)</h2>
+
+<p>The env supplies only a sparse terminal ±1. Training on that directly
+starves the early learner of signal. We add a dense <strong>shaped
+reward</strong> tuned to Orbit Wars, and decay its weight to zero over the
+first 50 iters so the policy eventually optimises the true objective.</p>
+
+<h3>4.1 Per-step shaped reward (per seat)</h3>
+
+<div class="math">
+r<sub>shape</sub>(t, seat) = <br>
+&nbsp;&nbsp;&nbsp;&nbsp; +0.10 · ΔP(seat)<sub>planet_count</sub><br>
+&nbsp;&nbsp;&nbsp;&nbsp; +0.02 · ΔP(seat)<sub>production_rate</sub><br>
+&nbsp;&nbsp;&nbsp;&nbsp; −0.10 · (ships_lost_to_sun<sub>this_turn</sub>) / 100<br>
+&nbsp;&nbsp;&nbsp;&nbsp; +0.05 · Δ(enemy_ships_destroyed) / 100 <br>
+, clipped to [−1, +1]
+</div>
+
+<p>Intuition behind each term:</p>
+<ul>
+  <li><strong>+0.10 × Δplanets</strong>: territory is the most stable proxy for
+      long-term ship production. Rewards capture, penalises loss. Largest
+      coefficient.</li>
+  <li><strong>+0.02 × Δproduction_rate</strong>: planets differ in production
+      (1–5 ships/turn, encoded by radius). Capturing a 5-production planet is
+      ~5× more valuable than a 1-production one, so we reward the rate
+      differential directly on top of the planet-count term.</li>
+  <li><strong>−0.10 × sun_kills / 100</strong>: ships lost to the sun are pure
+      waste — worst possible move. Penalised harder than most gains are
+      rewarded.</li>
+  <li><strong>+0.05 × enemy_killed / 100</strong>: offensive pressure even if
+      no planet changes hands. Rate-limited to keep this from dominating
+      short-term greedy combat over long-term territory.</li>
+</ul>
+
+<p>The <code>ΔX</code> notation is literally <code>X_now − X_prev</code>
+between consecutive turns of that seat's perspective.</p>
+
+<h3>4.2 Shape weight decay</h3>
+
+<p>To make sure we eventually optimise the true sparse ±1 objective:</p>
+
+<div class="math">
+w<sub>shape</sub>(iter) = max(0, 1 − iter / 50)
+</div>
+
+<p>So:</p>
+<ul>
+  <li>Iter 0–10: shape weight 1.0, policy driven mostly by shaping.</li>
+  <li>Iter 11–49: shape weight linearly decreasing; terminal reward slowly
+      takes over.</li>
+  <li>Iter 50–125: shape weight = 0; pure terminal ±1 — authentic objective.</li>
+</ul>
+
+<h3>4.3 Return (per recorded state)</h3>
+<p>For each (state, action) recorded for a seat during a game, the target
+return is:</p>
+
+<div class="math">
+G(t, seat) = w<sub>shape</sub>(iter) · Σ<sub>τ=t..T</sub> γ<sup>τ−t</sup> · r<sub>shape</sub>(τ, seat)
+             + terminal_reward(seat)
+</div>
+
+<p>with <code>γ = 0.997</code>. This is a Monte Carlo (not TD-λ) return —
+simpler, and with 500-step episodes the variance is manageable.</p>
+
+<div class="note">
+<strong>Design comment.</strong> The terminal ±1 is always added, even
+during the shaped-reward phase, so the value head is never predicting a
+meaningless quantity. What changes with <code>w_shape</code> is how much
+weight the dense intermediate-reward component carries.
+</div>
+
+<h2>5. Loss Function</h2>
+
+<p>All four components computed in the same forward pass (since the model
+shares an encoder). Every entry in the batch can be from any seat —
+winner or loser.</p>
+
+<h3>5.1 Policy gradient</h3>
+
+<div class="math">
+advantage(b) = G(b) − V<sub>θ</sub>(s<sub>b</sub>) ← .detach()<br>
+advantage ← (advantage − mean) / (std + 1e-6) ← batch-normalised<br>
+advantage ← clamp(advantage, −2, 2) ← stability clip<br>
+<br>
+L<sub>policy</sub> = −E<sub>b</sub>[ advantage(b) · log π<sub>θ</sub>(a<sub>b</sub> | s<sub>b</sub>) ]
+</div>
+
+<p>Because the advantage is positive for above-value outcomes (mostly winners
+and not-so-losing losers) and negative for below-value outcomes, the policy
+gradient pushes log-probability up when we did better than the value head
+expected, and down when worse. Crucially this handles losers correctly:
+their advantage is negative, so −(−) · log π minimises toward lower
+log-probability of those losing actions.</p>
+
+<h3>5.2 Value regression</h3>
+
+<div class="math">
+L<sub>value</sub> = ½ · E<sub>b</sub>[ ( V<sub>θ</sub>(s<sub>b</sub>) − G(b) )² ]
+</div>
+
+<h3>5.3 Entropy bonus</h3>
+
+<div class="math">
+H(s) = − E<sub>c</sub>[ π<sub>tgt</sub>(c | s) · log π<sub>tgt</sub>(c | s) ]
+<br>
+L<sub>entropy</sub> = −E<sub>b</sub>[ H(s<sub>b</sub>) ]    (i.e. subtract H to maximise entropy)
+</div>
+
+<p>We only entropy-regularise the target head (not the bucket head) since
+the target head is the higher-stakes decision.</p>
+
+<h3>5.4 Total loss</h3>
+
+<div class="math">
+L = L<sub>policy</sub> + 0.5 · L<sub>value</sub> − 0.01 · (−L<sub>entropy</sub>)
+</div>
+
+<p>Equivalently: <code>loss = policy_loss + 0.5*value_loss - 0.01*entropy</code>.</p>
+
+<h3>5.5 What we do NOT have (and why)</h3>
+<table>
+<tr><th>Not used</th><th>Reason</th></tr>
+<tr><td>Teacher KL (anchor to BC)</td>
+<td>BC is our <em>starting point</em>, not a strong upper bound; pulling the
+policy back to BC after it starts learning would cap progress. <code>v1</code>
+sets <code>teacher_kl_coef = 0</code> and the teacher forward pass is a
+no-op diagnostic.</td></tr>
+<tr><td>PPO clipping ratio</td>
+<td>Our rollouts are synchronous and on-policy: each iter's rollouts are
+generated by the weights we just broadcast, then we update. Importance
+ratio ≈ 1; clipping is unnecessary noise at this batch size.</td></tr>
+<tr><td>V-trace off-policy correction</td>
+<td>Same reason — nothing off-policy to correct for.</td></tr>
+<tr><td>UPGO</td>
+<td>Would need reliable Q(s, a); we don't train a Q head. Advantage
+normalisation + clip is our cheap substitute.</td></tr>
+<tr><td>TD(λ) returns</td>
+<td>Episodes cap at 500 steps and Monte-Carlo returns are the cleanest
+credit-assignment when episodes finish. If we add long self-play chains or
+horizon-extending rewards later, we'd add TD(λ).</td></tr>
+</table>
+
+<h2>6. Training Loop (impala_v1)</h2>
+
+<pre>persistent Pool of 4 workers, each:
+    imports torch once
+    loads OrbitAgent (empty weights)
+    disables env schema validation (~20% speedup)
+
+for iter in 0 .. 124:
+    broadcast current model state_dict bytes → 4 workers
+
+    each worker independently:
+        n_players ∼ uniform {2, 4}                  (four_player_prob = 0.5)
+        create env, env.reset(num_agents = n_players)
+
+        while not env.done:
+            for seat in range(n_players):
+                obs_shared = env.state[0].observation       # shared world state
+                obs_for_seat = {**obs_shared, player: seat}
+                action = model.forward(obs_for_seat)         # stochastic sample
+                actions[seat] = action
+            env.step(actions)                                # simultaneous apply
+
+        featurise per-seat (obs, action) tuples at each acting turn
+        compute per-step shaped reward trajectory
+        compute discounted shape return
+        attach terminal reward ±1 per seat
+        return all records to master
+
+    master gathers all records across 4 games:
+        compute advantages (shape_weight · G_shape + terminal - V(s))
+        normalise + clip
+        gradient step × grad_steps_per_iter (default 2):
+            L = policy_loss + 0.5 * value_loss - 0.01 * entropy
+            backward, clip grad norm to 1.0
+            AdamW step
+
+    every 10 iters: torch.save( model + kwargs + iter, out_path )
+</pre>
+
+<h3>Why synchronous, not asynchronous?</h3>
+<p>True IMPALA is actor-learner async with V-trace. For a CPU-only 4-worker
+setup, synchronous Pool.map() is simpler and removes the importance-sampling
+complexity. Actors generate, master trains, weights broadcast again — the
+"actor lag" is at most one iter rather than continuous.</p>
+
+<h3>Hyperparameters for <code>impala_v1</code></h3>
+<table>
+<tr><th>Name</th><th>Value</th><th>Notes</th></tr>
+<tr><td>iters</td><td>125</td><td>500 total games</td></tr>
+<tr><td>workers</td><td>4</td><td>Synchronous Pool</td></tr>
+<tr><td>grad_steps_per_iter</td><td>2</td><td>Multiple passes over the fresh batch</td></tr>
+<tr><td>four_player_prob</td><td>0.5</td><td>Half 4p / half 2p</td></tr>
+<tr><td>opp_temp</td><td>1.0</td><td>Sampling temperature during gameplay</td></tr>
+<tr><td>shape_decay_iters</td><td>50</td><td>Linear shape-weight decay to 0</td></tr>
+<tr><td>teacher_kl_coef</td><td>0.0</td><td>No teacher anchor</td></tr>
+<tr><td>lr</td><td>1e-4</td><td>AdamW, weight_decay 1e-5</td></tr>
+<tr><td>gamma</td><td>0.997</td><td>Shape-reward MC discount</td></tr>
+<tr><td>vf_coef</td><td>0.5</td><td>Value-loss weight</td></tr>
+<tr><td>ent_coef</td><td>0.01</td><td>Entropy regularisation weight</td></tr>
+<tr><td>clip_grad_norm</td><td>1.0</td><td>Global gradient clipping</td></tr>
+<tr><td>advantage clip</td><td>[-2, 2]</td><td>Per-sample, after normalisation</td></tr>
+</table>
+
+<h2>7. Why Every Seat Contributes (both winners and losers)</h2>
+
+<p>A common pitfall we explicitly avoid: training only on the winner's
+trajectory. Arguments against that:</p>
+<ul>
+  <li>In 2-player games, half the data is the loser; in 4-player, three
+      quarters. Throwing it away wastes sample efficiency.</li>
+  <li>Losers' moves are <em>negative examples</em>. Their terminal reward
+      is −1, so their advantages are negative, and the policy gradient
+      naturally pushes down log-probability of those choices. This is
+      gradient-correct, just the sign is flipped relative to winners.</li>
+  <li>The value head especially benefits: only seeing winning states biases
+      it optimistically; it needs losing states to learn that some
+      configurations are genuinely bad.</li>
+</ul>
+
+<p>Concretely in our implementation:</p>
+<pre>for seat in range(n_players):
+    records[seat] = [...all (obs, action) at this seat's acting turns...]
+    for feat in records[seat]:
+        feat["_terminal_reward"] = rewards[seat]   # +1 if winner else -1
+        feat["_shape_return"]   = monte_carlo_discounted_sum_for_seat
+
+# In master:
+all_samples = flatten(records over all workers, all seats)
+advantage  = normalise_clip(return - V)
+policy_loss, value_loss computed across ALL samples.</pre>
+
+<h2>8. <code>impala_v2</code>: Add <code>lb-928</code> Opponent Mixing</h2>
+
+<p>Pure self-play has a well-known failure mode: the agent learns to play
+against its own evolving distribution, not against real-world opponents.
+On the Kaggle leaderboard the biggest fixed opponent we'll face is the
+rules-based <code>lb-928</code> planner (currently in the public top 10).
+<code>impala_v2</code> adds it as a mix-in opponent during self-play.</p>
+
+<h3>8.1 Opponent assignment per game</h3>
+
+<pre>for each game started by a worker:
+    learner_seat = random.randint(0, n_players - 1)
+    for seat in range(n_players):
+        if seat == learner_seat:
+            seat_policy[seat] = current_model         # always self
+        else:
+            if random() < 0.5:
+                seat_policy[seat] = current_model     # self
+            else:
+                seat_policy[seat] = lb928_agent_fn    # fixed external
+</pre>
+
+<table>
+<tr><th>Game mode</th><th>Non-learner seats</th><th>Expected opponent mix</th></tr>
+<tr><td>2p</td><td>1</td><td>50 % self / 50 % lb-928</td></tr>
+<tr><td>4p</td><td>3</td><td>Independent 50 % each — ~1.5 lb-928 per game on average</td></tr>
+</table>
+
+<h3>8.2 Training-data rule</h3>
+
+<table>
+<tr><th>Seat type</th><th>Record data?</th><th>Why</th></tr>
+<tr class="keep"><td>Learner (always self)</td><td>✅ yes — policy + value loss</td>
+<td>It's our model acting; standard on-policy data.</td></tr>
+<tr class="keep"><td>Non-learner self</td><td>✅ yes — policy + value loss</td>
+<td>Same policy, just a different seat.</td></tr>
+<tr class="drop"><td>Non-learner <code>lb-928</code></td><td>❌ skip entirely</td>
+<td>The action distribution is rules-based, not derived from <code>π<sub>θ</sub></code>.
+Training on those actions would pull the policy toward imitating lb-928,
+which we tried via BC distillation (<code>bc_v3</code>) and found
+regressed performance. We want the lb-928 seats only as <em>opposition</em>,
+not as a training target.</td></tr>
+</table>
+
+<p>The self seats' training gradients are still correct: their advantages
+use their own seat's terminal reward (+1 winner, −1 loser).</p>
+
+<h3>8.3 Hyperparameter delta from <code>impala_v1</code></h3>
+<table>
+<tr><th>Flag</th><th><code>v1</code></th><th><code>v2</code></th></tr>
+<tr><td><code>--lb928-prob</code></td><td>0.0 (no lb-928 in games)</td><td><strong>0.5</strong></td></tr>
+<tr><td>Everything else</td><td colspan=2>unchanged: 125 iters × 4 workers × 500 games, lr 1e-4, shape decay 50 iters, no teacher KL</td></tr>
+</table>
+
+<h3>8.4 Expected effect</h3>
+<ul>
+  <li><strong>vs lb-928 eval win rate</strong>: should improve from 0 %
+      (our current floor) toward something non-zero. This is the primary
+      success metric.</li>
+  <li><strong>vs starter eval win rate</strong>: may dip slightly because
+      the policy trains less often against simple aggressive expansion,
+      more often against lb-928's complex planning.</li>
+  <li><strong>Value head calibration</strong>: should improve because V(s)
+      now sees states from lb-928's distribution, which differs sharply
+      from pure self-play.</li>
+  <li><strong>Policy diversity</strong>: marginal; we're adding one extra
+      opponent, not a league.</li>
+</ul>
+
+<h3>8.5 Risks</h3>
+<ul>
+  <li>Learner games against lb-928 terminate fast (lb-928 wipes out weak
+      policies in ~100 turns). Training samples per game drop accordingly,
+      but 4 workers × 125 iters compensates.</li>
+  <li>If 50 % lb-928 is too strong, the learner might collapse into
+      defensive play specialised against lb-928 rather than exploring
+      diverse strategies. Easy to tune via <code>--lb928-prob</code>.</li>
+  <li>Advantage normalisation may behave oddly if batches contain a mix of
+      "won easy vs self" and "got crushed by lb-928" — the mean/std will
+      be dominated by whichever regime has more samples. We keep the
+      advantage clip <code>[−2, 2]</code> to limit any single extreme
+      sample.</li>
+</ul>
+
+<h2>9. Evaluation</h2>
+
+<h3>9.1 Online during training</h3>
+<p>A separate <code>eval_watcher.py</code> process polls the saved
+checkpoint every 10 minutes. Whenever the <code>.pt</code> file's mtime
+changes, it loads the checkpoint, plays 10 games each vs <code>starter</code>
+and <code>lb-928</code> (alternating seats), and appends a row to
+<code>.impala_eval_watch.csv</code> with the two win rates and wall time.</p>
+
+<p>This runs on the spare GPU (GPU 1, with a hard 10 % memory cap) so it
+doesn't compete with the CPU-bound training workers.</p>
+
+<h3>9.2 Gate for submission</h3>
+<p>Before any new submission:</p>
+<ul>
+  <li>Win rate vs <code>lb-928</code> ≥ 5 % (currently 0 %; a little is big)</li>
+  <li>Win rate vs previous submission ≥ 55 % (N = 40 local games, alternating seats)</li>
+</ul>
+<p>Otherwise we keep iterating — a regression submission wastes a precious
+slot and the Kaggle "validation episode failed" error we already tripped
+once.</p>
+
+<h2>10. Deployment (Mode A: policy only)</h2>
+
+<p>At inference we do <strong>not</strong> run MCTS or any tree search.
+Each Kaggle turn:</p>
+
+<ol>
+  <li>Encode <code>obs</code> via the same <code>_encode_obs</code> used in
+      training.</li>
+  <li>Forward pass through <code>OrbitAgent</code> (3–5 ms on CPU).</li>
+  <li>Apply the sun-blocker mask to <code>target_logits</code>.</li>
+  <li>For each owned planet, <code>argmax</code> of
+      <code>target_logits</code>:
+      <ul>
+        <li>If class 0 (pass): skip — no move from this planet.</li>
+        <li>Else: translate <code>(tgt_class, bkt_class)</code> → env move
+            <code>[src_id, atan2(…), num_ships]</code>.</li>
+      </ul>
+  </li>
+  <li>Return list of moves.</li>
+</ol>
+
+<p>The <code>main.py</code> bundle uses lazy model loading (defers
+<code>torch.load</code> until the first <code>agent()</code> call) to keep
+import time under the 1 s actTimeout. The remaining 2 s of bankable
+overage absorbs the first-call cost.</p>
+
+<h2>11. File layout</h2>
+<pre>/home/lab/orbit-war/
+├── training/
+│   ├── model.py                       # OrbitAgent, sun_blocker_mask
+│   ├── agent.py                       # Inference-time agent(obs) callable
+│   ├── online_impala.py               # v1 trainer (current)
+│   ├── online_impala_v2.py            # v2 trainer (planned — copy + --lb928-prob)
+│   ├── mcts.py                        # disable_env_validation() patch used by v1
+│   ├── lb928_agent.py                 # Extracted from notebooks/lb-928-*.ipynb
+│   └── eval_watcher.py                # Polls ckpt, runs eval vs baselines
+├── experiments/
+│   └── 2026-04-19/
+│       ├── experiments_log.xlsx       # aggregate results table
+│       ├── impala_v1_2026-04-19/
+│       │   ├── README.md
+│       │   ├── method_impala_v1_v2.html  ← this file
+│       │   ├── run.log → ...
+│       │   ├── monitor.csv → ...
+│       │   ├── eval.csv → ...
+│       │   └── model.pt → ...
+│       └── impala_v2_lb928mix_2026-04-19/   (to be created)
+└── submission/
+    └── az_v1/
+        ├── main.py                    # lazy-load inference wrapper
+        └── model.pt                   # final checkpoint (copied after training)
+</pre>
+
+<h2>12. Key differences from the literature</h2>
+<table>
+<tr><th>Paper / System</th><th>Similarity</th><th>Difference in our setup</th></tr>
+<tr><td>AlphaStar (DeepMind 2019)</td>
+<td>PFSP opponent pool, per-unit action factorisation, teacher KL</td>
+<td>No league exploiters; single-teacher (none in <code>v1</code>); CPU-only
+4 actors vs 16k TPUs.</td></tr>
+<tr><td>Lux AI S1 winner (Pressman 2021)</td>
+<td>IMPALA-ish, shaped-reward decay, teacher KL to BC, per-unit heads</td>
+<td>No actual IMPALA V-trace; synchronous; no UPGO; Set Transformer
+replaces 24-block ResNet.</td></tr>
+<tr><td>AlphaZero (Silver 2017)</td>
+<td>Shared policy+value tower</td>
+<td>No MCTS at training or inference (for mode A). Tree search is too
+expensive per-turn and Kaggle RTS winners have never used it.</td></tr>
+<tr><td>PPO (Schulman 2017)</td>
+<td>Advantage normalisation, clipped advantages</td>
+<td>No importance ratio clip (on-policy); simpler loss formulation.</td></tr>
+<tr><td>MAPPO (Yu 2022)</td>
+<td>Simultaneous-move multi-agent; shared critic</td>
+<td>Our critic is the same encoder shared with policy, not a separate
+centralised critic.</td></tr>
+</table>
+
+<h2>13. Open questions / future work</h2>
+<ul>
+  <li><strong>Model size</strong>: 0.9 M may bottleneck. If <code>impala_v1</code>
+      plateaus well below <code>lb-928</code>, widen to 4 M (d_model = 256,
+      8 layers).</li>
+  <li><strong>League training</strong>: add frozen snapshots to the opponent
+      pool as <code>self_u10</code>, <code>self_u20</code>, … every N iters
+      (AlphaStar-lite). We keep the hook (was there in earlier PPO attempts)
+      but don't use it in <code>v1</code> or <code>v2</code>.</li>
+  <li><strong>Inference-time MCTS (Mode B)</strong>: if policy-only
+      <code>impala</code> plateaus, Sampled MuZero / Gumbel MuZero via
+      LightZero could add tactical depth at the cost of ~500 ms per turn.
+      Risk: Kaggle actTimeout violations.</li>
+  <li><strong>180° augmentation</strong>: the board has centre symmetry;
+      mirroring planets through (50, 50) doubles usable training data with
+      no correctness cost.</li>
+  <li><strong>Per-seat opponent sampling in self-play</strong>: right now
+      all non-learner seats in a game use one policy choice. We could
+      sample independently per seat per step, but this breaks the
+      "what game was this" assumption for reward shaping.</li>
+  <li><strong>Curriculum on game length</strong>: start with games capped
+      at 200 steps, lift to 500 once the value head is stable. Would make
+      early iterations ~2× faster.</li>
+</ul>
+
+<div class="footer">
+Generated from <code>training/online_impala.py</code>,
+<code>training/model.py</code>, <code>training/agent.py</code>, and
+<code>training/mcts.py</code> as of 2026-04-19.
+Companion XLSX: <code>experiments/experiments_log.xlsx</code>.
+</div>
+
+</body>
+</html>
