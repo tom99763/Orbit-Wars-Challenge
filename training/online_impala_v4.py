@@ -1,21 +1,23 @@
-"""impala_v3: Exploration upgrades on top of v2.
+"""impala_v4: Physics-accurate aiming on top of v3.
 
-Inherits from v2 (lb-928 opponent mix, no teacher, shape-decay) with:
- 1. Entropy coef schedule  (high 0.03 first 30 iters, then 0.005)
- 2. Temperature schedule   (linear 1.2 → 0.7 over all iters)
- 3. Random opponent mix    (--random-opp-prob, default 0.06)
- 4. Per-planet action noise (--planet-action-noise, default 0.10)
- 5. **Versioned checkpoint saves** — per-N-iter saves with iter number
-    preserved so we never lose a peak checkpoint to overwrite again.
- 6. Lower lb-928 probability (--lb928-prob default 0.1, per user spec)
+Everything from v3 (exploration schedules, versioned ckpts, vs928 tracking,
+reward / adv logging) plus:
+
+ * Worker passes `physics_aim_ctx` to sample_joint_action. Launch angles are
+   computed via lb928's `aim_with_prediction` so fleets are aimed at the
+   target planet's PREDICTED position at arrival time (avoids sun).
+   Fallback to atan2 only if physics solver finds no safe intercept.
+
+This fixes the dominant geometry gap where the learned policy was sending
+fleets to where orbital targets ARE NOW (they move during flight).
 
 Launch:
-  python training/online_impala_v3.py \
+  python training/online_impala_v4.py \
       --bc-ckpt training/checkpoints/bc_v2.pt \
-      --out training/checkpoints/impala_v3.pt \
-      --iters 125 --workers 4 --four-player-prob 0.5 \
-      --lb928-prob 0.1 --random-opp-prob 0.06 --planet-action-noise 0.10 \
-      --shape-decay-iters 50 --lr 1e-4
+      --out training/checkpoints/impala_v4.pt \
+      --iters 125 --workers 4 --four-player-prob 0.2 \
+      --lb928-prob 0.5 --random-opp-prob 0.0 --random-opp-end 0.0 \
+      --planet-action-noise 0.10 --shape-decay-iters 50 --lr 1e-4 --random-init
 """
 
 from __future__ import annotations
@@ -138,6 +140,17 @@ def _worker_play(task: dict) -> dict:
 
     while not env.done:
         actions: list = [None] * n_players
+        step_obs0 = env.state[0].observation
+        step_comets = list(step_obs0.get("comets") or [])
+        for p in list(step_obs0.get("planets") or []):
+            if int(p[0]) not in init_ids:
+                comet_ids.add(int(p[0]))
+        physics_ctx = {
+            "ang_vel": ang_vel,
+            "initial_planets": init_planets,
+            "comets": step_comets,
+            "comet_ids": comet_ids,
+        }
         for seat in range(n_players):
             obs = _shared_obs(env, seat)
             if seat_types[seat] == "self":
@@ -146,6 +159,7 @@ def _worker_play(task: dict) -> dict:
                     tl, bl, planets_raw, omask,
                     temperature=opp_temp,
                     planet_action_noise=planet_action_noise,
+                    physics_aim_ctx=physics_ctx,
                 )
                 actions[seat] = m
             elif seat_types[seat] == "lb928":
@@ -255,7 +269,7 @@ def main() -> int:
     ap.add_argument("--grad-steps-per-iter", type=int, default=2)
     ap.add_argument("--snapshot-every", type=int, default=10,
                     help="Save versioned ckpt every N iters")
-    ap.add_argument("--monitor", default=".impala_v3_monitor.csv")
+    ap.add_argument("--monitor", default=".impala_v4_monitor.csv")
     # Architecture overrides — if any set, start from random init (skip warm-start)
     ap.add_argument("--d-model", type=int, default=None)
     ap.add_argument("--n-layers", type=int, default=None)
@@ -323,7 +337,7 @@ def main() -> int:
     pool = mp.Pool(args.workers, initializer=_worker_init,
                    initargs=(kwargs, teacher_state))
 
-    print(f"impala_v3 self-play: iters={args.iters} workers={args.workers}", flush=True)
+    print(f"impala_v4 self-play (physics aim): iters={args.iters} workers={args.workers}", flush=True)
     print(f"  lb928_prob={args.lb928_prob}  "
           f"random_opp {args.random_opp_prob}→{args.random_opp_end} "
           f"over {args.random_opp_decay_iters} iters", flush=True)

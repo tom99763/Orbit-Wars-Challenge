@@ -116,7 +116,8 @@ def sample_joint_action(tgt_logits: torch.Tensor, bkt_logits: torch.Tensor,
                         planets_raw: list, owned_mask: np.ndarray,
                         temperature: float = 1.0,
                         deterministic: bool = False,
-                        planet_action_noise: float = 0.0):
+                        planet_action_noise: float = 0.0,
+                        physics_aim_ctx: dict | None = None):
     """Sample ONE joint action (one tuple per owned planet) and compute its
     joint log-prob. Returns (sub_action, env_move, log_prob).
 
@@ -165,7 +166,17 @@ def sample_joint_action(tgt_logits: torch.Tensor, bkt_logits: torch.Tensor,
         ships = max(1, int(round(SHIPS_BUCKETS[bkt] * garrison)))
         if ships <= 0 or ships > garrison:
             continue
-        ang = math.atan2(tgt[3] - src[3], tgt[2] - src[2])
+        if physics_aim_ctx is not None:
+            from physics_aim import compute_aim_angle
+            ang = compute_aim_angle(
+                src, tgt, ships,
+                physics_aim_ctx["ang_vel"],
+                physics_aim_ctx["initial_planets"],
+                physics_aim_ctx.get("comets"),
+                physics_aim_ctx.get("comet_ids"),
+            )
+        else:
+            ang = math.atan2(tgt[3] - src[3], tgt[2] - src[2])
         env_move.append([int(src[0]), float(ang), int(ships)])
     return sub, env_move, log_prob
 
