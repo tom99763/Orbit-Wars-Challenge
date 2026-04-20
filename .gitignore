@@ -64,3 +64,9 @@ __pycache__/
 
 # Large notebooks with full outputs (keep code-only notebooks)
 notebooks/getting-started.ipynb
+.imitation_then_eval.log
+.imitation_then_eval.stdout
+.eval_vs_starter.log
+.lb1200_vs_starter*.log
+.smoke_imitation.log
+.lb1200_gen.log

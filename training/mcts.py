@@ -101,7 +101,8 @@ def _forward_policy(model: OrbitAgent, obs_dict: dict, device: str = "cpu"):
         fleets = torch.from_numpy(ff).unsqueeze(0)
         fleet_mask = torch.ones((1, ff.shape[0]), dtype=torch.bool)
     else:
-        fleets = torch.zeros((1, 1, 9), dtype=torch.float32)
+        from featurize import FLEET_DIM
+        fleets = torch.zeros((1, 1, FLEET_DIM), dtype=torch.float32)
         fleet_mask = torch.zeros((1, 1), dtype=torch.bool)
     globals_ = torch.from_numpy(g).unsqueeze(0)
     tgt_mask = sun_blocker_mask(planet_xy, planet_mask)
@@ -153,10 +154,12 @@ def sample_joint_action(tgt_logits: torch.Tensor, bkt_logits: torch.Tensor,
         else:
             tgt_class = int(np.random.choice(len(t_prob[i]), p=t_prob[i]))
             bkt = int(np.random.choice(len(b_prob[i]), p=b_prob[i]))
-        log_prob += float(t_logp[i, tgt_class]) + float(b_logp[i, bkt])
         sub.append((int(si), tgt_class, bkt))
         if tgt_class == 0:
             continue
+        # Only accumulate log-prob for ACTIVE actions; pass actions are not
+        # fed back through training's policy gradient.
+        log_prob += float(t_logp[i, tgt_class]) + float(b_logp[i, bkt])
         tgt_idx = tgt_class - 1
         if tgt_idx >= len(planets_raw):
             continue

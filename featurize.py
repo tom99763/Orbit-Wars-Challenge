@@ -141,16 +141,51 @@ def fleet_eta_norm(fleet):
     return min(t / speed, 200.0) / 50.0
 
 
+HISTORY_K = 3  # sliding window size for obs and action history
+PLANET_DIM = 23 + HISTORY_K * 4   # +4 context + 4×K past-obs dims = 35
+FLEET_DIM = 10
+GLOBAL_DIM = 26 + HISTORY_K * 4   # +2 cumulative + 4×K past-action dims = 38
+
+
 def featurize_step(step_dict, agent_idx, angular_velocity, n_players, initial_planets,
-                   comet_ids=None):
+                   comet_ids=None, last_actions_by_planet=None,
+                   cumulative_stats=None,
+                   obs_history=None, action_history=None):
     planets = step_dict["planets"]
     fleets = step_dict["fleets"]
     action = step_dict["action"] or []
     step = step_dict["step"]
     comet_ids = set(comet_ids or [])
+    last_actions_by_planet = last_actions_by_planet or {}
+    cumulative_stats = cumulative_stats or {"total_ships_sent": 0,
+                                             "total_actions": 0}
+    # obs_history: list of up to K previous raw obs dicts (oldest→newest), each
+    # must have {"planets": list, "step": int}. If len<K, older slots pad zeros.
+    obs_history = obs_history or []
+    # action_history: list of up to K recent (src_pid, tgt_pid, bkt_idx, turn)
+    # tuples for this seat (oldest→newest).
+    action_history = action_history or []
+
+    # Initial-position lookup for orbit prediction
+    init_by_id = {int(p[0]): p for p in (initial_planets or [])}
+
+    def _predict_future_xy(pid, x, y, r, dt):
+        """Predict (x, y) at time step+dt using lb-1200's formula: rotate around
+        center at angular_velocity · dt, preserving orbit radius. Static planets
+        (outer) don't move."""
+        init = init_by_id.get(int(pid))
+        if init is None:
+            return x, y
+        _, _, ix, iy, iradius, _, _ = init
+        orb_r = math.hypot(ix - CENTER, iy - CENTER)
+        if orb_r + iradius >= ROT_LIMIT:
+            return x, y  # static
+        cur_ang = math.atan2(y - CENTER, x - CENTER)
+        new_ang = cur_ang + angular_velocity * dt
+        return CENTER + orb_r * math.cos(new_ang), CENTER + orb_r * math.sin(new_ang)
 
     N = len(planets)
-    planet_feat = np.zeros((N, 14), dtype=np.float32)
+    planet_feat = np.zeros((N, PLANET_DIM), dtype=np.float32)
     planet_ids = np.zeros((N,), dtype=np.int32)
     planet_xy = np.zeros((N, 2), dtype=np.float32)
     action_mask_owned = np.zeros((N,), dtype=bool)
@@ -168,14 +203,59 @@ def featurize_step(step_dict, agent_idx, angular_velocity, n_players, initial_pl
         if 1 <= prod <= PROD_MAX:
             planet_feat[i, 6 + prod] = 1.0
         orb_r = math.hypot(x - CENTER, y - CENTER)
-        planet_feat[i, 12] = 1.0 if (orb_r + r >= ROT_LIMIT) else 0.0
+        is_static = (orb_r + r >= ROT_LIMIT)
+        planet_feat[i, 12] = 1.0 if is_static else 0.0
         planet_feat[i, 13] = 1.0 if pid in comet_ids else 0.0
+        # Physics additions (lb-1200 borrow):
+        # [14,15] future (x,y) at t+10 normalized; [16,17] at t+20.
+        fx10, fy10 = _predict_future_xy(pid, x, y, r, 10)
+        fx20, fy20 = _predict_future_xy(pid, x, y, r, 20)
+        planet_feat[i, 14] = (fx10 - CENTER) / CENTER
+        planet_feat[i, 15] = (fy10 - CENTER) / CENTER
+        planet_feat[i, 16] = (fx20 - CENTER) / CENTER
+        planet_feat[i, 17] = (fy20 - CENTER) / CENTER
+        # [18] is-rotating (complement of static; makes it explicit for model)
+        planet_feat[i, 18] = 0.0 if is_static else 1.0
+        # [19-22] Context history: what did this planet do previously?
+        last = last_actions_by_planet.get(int(pid))
+        if last is not None:
+            last_tgt_pid, last_bkt_idx, last_turn, n_actions = last
+            turns_ago = max(0, step - last_turn)
+            # Decay: 0 = just acted, 1 ≈ ≥20 turns ago
+            planet_feat[i, 19] = math.exp(-turns_ago / 10.0)
+            # Last target as normalized idx (use max_pid computed later; fallback)
+            planet_feat[i, 20] = float(last_tgt_pid) / 40.0 if last_tgt_pid >= 0 else 0.0
+            planet_feat[i, 21] = last_bkt_idx / 3.0
+            planet_feat[i, 22] = math.log1p(n_actions) / 5.0
+        # else all 0 — no history yet
+        # [23-34] Sliding window: this planet's state at t-1, t-2, t-3
+        # 4 dims per timestep: (was_present, was_mine, was_enemy, ships_log)
+        for k in range(HISTORY_K):
+            # obs_history stored oldest→newest; we want newest at k=0
+            idx = len(obs_history) - 1 - k
+            base = 23 + k * 4
+            if idx < 0:
+                continue  # keep zeros — no history yet
+            prev_obs = obs_history[idx]
+            prev_planets = prev_obs.get("planets") or []
+            # Find this planet by pid
+            match = None
+            for pp in prev_planets:
+                if int(pp[0]) == int(pid):
+                    match = pp
+                    break
+            if match is None:
+                continue  # planet didn't exist then — stay zero
+            planet_feat[i, base + 0] = 1.0  # was_present
+            planet_feat[i, base + 1] = 1.0 if match[1] == agent_idx else 0.0
+            planet_feat[i, base + 2] = 1.0 if (match[1] != agent_idx and match[1] != -1) else 0.0
+            planet_feat[i, base + 3] = math.log1p(max(0, match[5])) / 8.0
         if owner == agent_idx and ships > 0:
             action_mask_owned[i] = True
 
-    # Fleets
+    # Fleets (lb-1200 addition: inferred target planet id)
     F = len(fleets)
-    fleet_feat = np.zeros((F, 9), dtype=np.float32)
+    fleet_feat = np.zeros((F, FLEET_DIM), dtype=np.float32)
     max_pid = max(planet_ids.max(initial=1), 1)
     for i, f in enumerate(fleets):
         fid, owner, x, y, ang, from_id, ships = f
@@ -188,9 +268,13 @@ def featurize_step(step_dict, agent_idx, angular_velocity, n_players, initial_pl
         fleet_feat[i, 6] = math.log1p(max(0, ships)) / 8.0
         fleet_feat[i, 7] = from_id / max_pid
         fleet_feat[i, 8] = fleet_eta_norm(f)
+        # [9] inferred target planet (from angle + position)
+        src_proxy = (fid, owner, x, y, 0.0, ships, 0)  # pseudo-planet struct
+        tgt_i = nearest_target_index(src_proxy, ang, planets)
+        fleet_feat[i, 9] = (planet_ids[tgt_i] / max_pid) if tgt_i is not None else 0.0
 
-    # Globals
-    G = 16
+    # Globals (lb-1200 addition: phase one-hot, per-player strength)
+    G = GLOBAL_DIM
     g = np.zeros((G,), dtype=np.float32)
     g[0] = step / 500.0
     g[1] = angular_velocity
@@ -211,6 +295,49 @@ def featurize_step(step_dict, agent_idx, angular_velocity, n_players, initial_pl
     phase = angular_velocity * step
     g[14] = math.sin(phase)
     g[15] = math.cos(phase)
+    # Phase one-hot (lb-1200 uses turn-count phases): early/opening/mid/late/very_late
+    remaining = 500 - step
+    if step < 40: phase_idx = 0        # early
+    elif step < 80: phase_idx = 1      # opening
+    elif remaining > 60: phase_idx = 2 # mid
+    elif remaining > 25: phase_idx = 3 # late
+    else: phase_idx = 4                # very_late
+    g[16 + phase_idx] = 1.0            # slots 16..20
+    # Per-player strength stats: weakest enemy / strongest enemy / my rank
+    strengths = [0.0] * max(n_players, 1)
+    for p in planets:
+        if p[1] != -1 and 0 <= p[1] < len(strengths):
+            strengths[p[1]] += p[5]
+    for f in fleets:
+        if 0 <= f[1] < len(strengths):
+            strengths[f[1]] += f[6]
+    others = [strengths[o] for o in range(n_players) if o != agent_idx]
+    if others:
+        weak = min(others); strong = max(others)
+        # normalize via log to keep in a bounded range
+        g[21] = math.log1p(weak) / 8.0
+        g[22] = math.log1p(strong) / 8.0
+        # my rank among all players (0 = worst, 1 = best)
+        sorted_s = sorted(strengths)
+        rank = sorted_s.index(strengths[agent_idx]) if strengths[agent_idx] in sorted_s else 0
+        g[23] = rank / max(1, n_players - 1)
+    else:
+        g[21] = g[22] = g[23] = 0.0
+    # Cumulative context globals: total ships sent so far + action count
+    g[24] = math.log1p(cumulative_stats.get("total_ships_sent", 0)) / 10.0
+    g[25] = math.log1p(cumulative_stats.get("total_actions", 0)) / 6.0
+    # [26-37] Sliding window of last K actions (globally): 4 dims each
+    # (src_pid_norm, tgt_pid_norm, bucket/3, turns_ago_decay)
+    for k in range(HISTORY_K):
+        idx = len(action_history) - 1 - k  # newest at k=0
+        base = 26 + k * 4
+        if idx < 0:
+            continue  # zeros = no action yet
+        src_pid, tgt_pid, bkt_idx, act_turn = action_history[idx]
+        g[base + 0] = float(src_pid) / 40.0 if src_pid >= 0 else 0.0
+        g[base + 1] = float(tgt_pid) / 40.0 if tgt_pid >= 0 else 0.0
+        g[base + 2] = bkt_idx / 3.0
+        g[base + 3] = math.exp(-max(0, step - act_turn) / 10.0)
 
     # Action targets (only non-pass actions)
     src_idx, tgt_idx, bucket = [], [], []

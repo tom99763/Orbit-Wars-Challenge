@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 from training.model import OrbitAgent, sun_blocker_mask
+from featurize import featurize_step
 
 
 BOARD = 100.0
@@ -34,7 +35,17 @@ for s in COMET_SPAWN:
         COMET_WIN.add(s + d)
 
 
-def _encode_obs(obs: dict, max_planets: int = 64, max_fleets: int = 64):
+def _encode_obs(obs: dict, session=None,
+                max_planets: int = 64, max_fleets: int = 64):
+    """Inference-time obs encoder. Delegates to featurize.featurize_step so
+    the feature schema always matches training. The optional `session` dict
+    carries sliding-window history across successive calls within one game:
+        session["obs_history"]           deque[dict]
+        session["action_history"]        deque[(src_pid, tgt_pid, bkt, turn)]
+        session["last_actions_by_planet"] dict[pid → (tgt_pid, bkt, turn, n)]
+        session["cumulative_stats"]      dict
+        session["last_step"]             int   # reset detector
+    """
     planets_raw = obs.get("planets") or []
     fleets_raw = obs.get("fleets") or []
     player = int(obs.get("player", 0))
@@ -43,82 +54,43 @@ def _encode_obs(obs: dict, max_planets: int = 64, max_fleets: int = 64):
     initial_planets = obs.get("initial_planets") or []
     init_ids = {int(p[0]) for p in initial_planets}
 
-    N = min(len(planets_raw), max_planets)
-    F = min(len(fleets_raw), max_fleets)
-
-    planet_feat = np.zeros((N, 14), dtype=np.float32)
-    planet_xy = np.zeros((N, 2), dtype=np.float32)
-    planet_ids = np.zeros((N,), dtype=np.int64)
-    action_mask = np.zeros((N,), dtype=bool)
-    for i, p in enumerate(planets_raw[:N]):
-        pid, owner, x, y, r, ships, prod = p
-        planet_ids[i] = pid
-        planet_xy[i] = (x, y)
-        planet_feat[i, 0] = 1.0 if owner == player else 0.0
-        planet_feat[i, 1] = 1.0 if (owner != player and owner != -1) else 0.0
-        planet_feat[i, 2] = 1.0 if owner == -1 else 0.0
-        planet_feat[i, 3] = (x - CENTER) / CENTER
-        planet_feat[i, 4] = (y - CENTER) / CENTER
-        planet_feat[i, 5] = r
-        planet_feat[i, 6] = math.log1p(max(0, ships)) / 8.0
-        if 1 <= prod <= 5:
-            planet_feat[i, 6 + prod] = 1.0
-        orb_r = math.hypot(x - CENTER, y - CENTER)
-        planet_feat[i, 12] = 1.0 if (orb_r + r >= ROT_LIMIT) else 0.0
-        planet_feat[i, 13] = 1.0 if int(pid) not in init_ids else 0.0
-        if owner == player and ships > 0:
-            action_mask[i] = True
-
-    fleet_feat = np.zeros((F, 9), dtype=np.float32)
-    max_pid = max(int(planet_ids.max() if N else 1), 1)
-    for i, f in enumerate(fleets_raw[:F]):
-        fid, owner, x, y, ang, from_id, ships = f
-        fleet_feat[i, 0] = 1.0 if owner == player else 0.0
-        fleet_feat[i, 1] = 1.0 if owner != player else 0.0
-        fleet_feat[i, 2] = (x - CENTER) / CENTER
-        fleet_feat[i, 3] = (y - CENTER) / CENTER
-        fleet_feat[i, 4] = math.sin(ang)
-        fleet_feat[i, 5] = math.cos(ang)
-        fleet_feat[i, 6] = math.log1p(max(0, ships)) / 8.0
-        fleet_feat[i, 7] = from_id / max_pid
-        # eta_norm rough
-        speed = 1.0 + 5.0 * (math.log(max(1, ships)) / math.log(1000)) ** 1.5
-        speed = min(speed, 6.0)
-        fleet_feat[i, 8] = 50.0 / (speed + 0.1) / 50.0
-
-    # Count ships quickly
-    my_total = sum(p[5] for p in planets_raw if p[1] == player) + sum(
-        f[6] for f in fleets_raw if f[1] == player
-    )
-    enemy_total = sum(p[5] for p in planets_raw if p[1] != player and p[1] != -1) + sum(
-        f[6] for f in fleets_raw if f[1] != player
-    )
-    n_my_pl = sum(1 for p in planets_raw if p[1] == player)
-    n_en_pl = sum(1 for p in planets_raw if p[1] != player and p[1] != -1)
-    n_nu_pl = sum(1 for p in planets_raw if p[1] == -1)
-    # n_players we can't know exactly from obs — infer from distinct owners
     owners = {p[1] for p in planets_raw if p[1] != -1} | {f[1] for f in fleets_raw}
     n_players = 4 if len(owners) > 2 else 2
 
-    g = np.zeros((16,), dtype=np.float32)
-    g[0] = step / 500.0
-    g[1] = ang_vel
-    g[2] = max(0.0, (500 - step) / 500.0)
-    if 0 <= player <= 3:
-        g[3 + player] = 1.0
-    g[7] = 1.0 if n_players == 4 else 0.0
-    g[8] = n_my_pl / 20.0
-    g[9] = n_en_pl / 20.0
-    g[10] = n_nu_pl / 20.0
-    g[11] = math.log1p(my_total) / 8.0
-    g[12] = math.log1p(enemy_total) / 8.0
-    g[13] = 1.0 if step in COMET_WIN else 0.0
-    phase = ang_vel * step
-    g[14] = math.sin(phase)
-    g[15] = math.cos(phase)
+    comet_ids = {int(p[0]) for p in planets_raw if int(p[0]) not in init_ids}
 
-    return (planet_feat, planet_xy, planet_ids, action_mask,
-            fleet_feat, g, planets_raw, player)
+    my_total = sum(p[5] for p in planets_raw if p[1] == player) + sum(
+        f[6] for f in fleets_raw if f[1] == player)
+    enemy_total = sum(p[5] for p in planets_raw if p[1] != player and p[1] != -1) + sum(
+        f[6] for f in fleets_raw if f[1] != player)
+    n_my = sum(1 for p in planets_raw if p[1] == player)
+    n_en = sum(1 for p in planets_raw if p[1] != player and p[1] != -1)
+    n_nu = sum(1 for p in planets_raw if p[1] == -1)
+
+    step_dict = {
+        "step": step,
+        "planets": list(planets_raw[:max_planets]),
+        "fleets": list(fleets_raw[:max_fleets]),
+        "action": [],
+        "my_total_ships": my_total,
+        "enemy_total_ships": enemy_total,
+        "my_planet_count": n_my,
+        "enemy_planet_count": n_en,
+        "neutral_planet_count": n_nu,
+    }
+    obs_hist = list(session["obs_history"]) if session else []
+    act_hist = list(session["action_history"]) if session else []
+    last_actions = session["last_actions_by_planet"] if session else {}
+    cum_stats = session["cumulative_stats"] if session else None
+    feat = featurize_step(
+        step_dict, player, ang_vel, n_players, initial_planets, comet_ids,
+        last_actions_by_planet=last_actions, cumulative_stats=cum_stats,
+        obs_history=obs_hist, action_history=act_hist,
+    )
+
+    return (feat["planets"], feat["planet_xy"], feat["planet_ids"].astype(np.int64),
+            feat["action_mask_owned"], feat["fleets"], feat["globals"],
+            list(planets_raw[:max_planets]), player)
 
 
 def load_agent(ckpt_path: str, device: str = "cpu",
@@ -132,10 +104,29 @@ def load_agent(ckpt_path: str, device: str = "cpu",
     model.eval()
 
     from physics_aim import compute_aim_angle
+    from featurize import ship_bucket_idx, HISTORY_K, nearest_target_index
+    import collections
+
+    session = {
+        "obs_history": collections.deque(maxlen=HISTORY_K),
+        "action_history": collections.deque(maxlen=HISTORY_K),
+        "last_actions_by_planet": {},
+        "cumulative_stats": {"total_ships_sent": 0, "total_actions": 0},
+        "last_step": -1,
+    }
 
     def agent(obs: dict) -> list:
         obs = obs if isinstance(obs, dict) else dict(obs)
-        (pf, pxy, pids, omask, ff, g, planets_raw, player) = _encode_obs(obs)
+        step = int(obs.get("step") or 0)
+        # Reset session if we detect game restart (step went backwards)
+        if step < session["last_step"]:
+            session["obs_history"].clear()
+            session["action_history"].clear()
+            session["last_actions_by_planet"].clear()
+            session["cumulative_stats"] = {"total_ships_sent": 0, "total_actions": 0}
+        session["last_step"] = step
+
+        (pf, pxy, pids, omask, ff, g, planets_raw, player) = _encode_obs(obs, session)
         if not omask.any() or len(planets_raw) == 0:
             return []
         ang_vel = float(obs.get("angular_velocity") or 0.0)
@@ -150,7 +141,8 @@ def load_agent(ckpt_path: str, device: str = "cpu",
                 fleets = torch.from_numpy(ff).unsqueeze(0).to(device)
                 fleet_mask = torch.ones((1, ff.shape[0]), dtype=torch.bool, device=device)
             else:
-                fleets = torch.zeros((1, 1, 9), device=device)
+                from featurize import FLEET_DIM
+                fleets = torch.zeros((1, 1, FLEET_DIM), device=device)
                 fleet_mask = torch.zeros((1, 1), dtype=torch.bool, device=device)
             globals_ = torch.from_numpy(g).unsqueeze(0).to(device)
             tgt_mask = sun_blocker_mask(planet_xy, planet_mask)
@@ -193,6 +185,31 @@ def load_agent(ckpt_path: str, device: str = "cpu",
                 ang_vel, init_planets, comets, comet_ids,
             )
             moves.append([int(src[0]), float(angle), int(num_ships)])
+        # Update session history with this turn's obs + actions
+        session["obs_history"].append({"planets": list(planets_raw), "step": step})
+        for m in moves:
+            src_pid, ang, ships = m
+            # find planet in planets_raw for target inference
+            src_p = None
+            for p in planets_raw:
+                if int(p[0]) == int(src_pid):
+                    src_p = p
+                    break
+            if src_p is None:
+                continue
+            tgt_i = nearest_target_index(src_p, ang, planets_raw)
+            tgt_pid = int(planets_raw[tgt_i][0]) if tgt_i is not None else -1
+            garrison = int(src_p[5]) + int(ships)
+            bkt_idx = ship_bucket_idx(int(ships), max(1, garrison))
+            prev = session["last_actions_by_planet"].get(int(src_pid),
+                                                          (-1, 0, -1, 0))
+            session["last_actions_by_planet"][int(src_pid)] = (
+                tgt_pid, bkt_idx, step, prev[3] + 1
+            )
+            session["cumulative_stats"]["total_ships_sent"] += int(ships)
+            session["cumulative_stats"]["total_actions"] += 1
+            session["action_history"].append(
+                (int(src_pid), tgt_pid, bkt_idx, step))
         return moves
 
     return agent

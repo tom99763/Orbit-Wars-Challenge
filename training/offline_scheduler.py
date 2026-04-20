@@ -61,11 +61,24 @@ def release_lock() -> None:
     shutil.rmtree(LOCK, ignore_errors=True)
 
 
-def seconds_until_midnight() -> float:
+INTERVAL_HR = 5
+
+
+def next_fire_time(start_anchor: datetime.datetime) -> datetime.datetime:
+    """Next :00 boundary that's a multiple of INTERVAL_HR since the anchor.
+    Ensures the first run starts at the anchor (tomorrow 00:00) and then
+    marches every INTERVAL_HR. Skips past any fires already in the past."""
     now = datetime.datetime.now()
-    tomorrow = (now + datetime.timedelta(days=1)).replace(
+    t = start_anchor
+    while t <= now:
+        t += datetime.timedelta(hours=INTERVAL_HR)
+    return t
+
+
+def tomorrow_midnight() -> datetime.datetime:
+    now = datetime.datetime.now()
+    return (now + datetime.timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0)
-    return (tomorrow - now).total_seconds()
 
 
 def run_update() -> int:
@@ -105,6 +118,11 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
+    # Anchor the schedule: first fire at tomorrow 00:00, then every INTERVAL_HR.
+    anchor = tomorrow_midnight()
+    log(f"schedule anchor: {anchor.isoformat(timespec='seconds')} "
+        f"+ every {INTERVAL_HR}h")
+
     try:
         if args.now:
             try:
@@ -116,10 +134,10 @@ def main() -> int:
             if datetime.datetime.now() >= deadline:
                 log("expired — exiting")
                 break
-            wait = seconds_until_midnight()
-            target = datetime.datetime.now() + datetime.timedelta(seconds=wait)
+            target = next_fire_time(anchor)
+            wait = (target - datetime.datetime.now()).total_seconds()
             log(f"sleeping {wait/3600:.2f} hr until {target.strftime('%Y-%m-%d %H:%M:%S')}")
-            time.sleep(wait)
+            time.sleep(max(wait, 1))
             if datetime.datetime.now() >= deadline:
                 break
             try:

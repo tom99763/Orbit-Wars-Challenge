@@ -58,17 +58,26 @@ from featurize import featurize_step
 # Orbit-Wars-specific reward shaping
 # ---------------------------------------------------------------
 
+TOTAL_STEPS = 500
+
+
 def compute_shaped_rewards(env_steps, seat: int) -> list[float]:
     """Dense shaped reward per step for a given seat.
 
-    Components:
-      +0.10 · Δmy_planet_count          (territory gain)
-      +0.02 · Δmy_production_rate       (economic lead)
-      -0.10 · my_ships_vanishing_near_sun (sun-kill penalty)
-      +0.05 · Δenemy_ships_destroyed_in_combat (offensive kills)
+    Original components:
+      +0.10 · Δmy_planet_count              (territory gain)
+      +0.02 · Δmy_production_rate           (economic lead)
+      -0.10 · sun_kills / 100               (discipline)
+      +0.10 · Δenemy_ships_destroyed / 50   (offensive kills, boosted)
+
+    lb-1200 inspired additions (2026-04-19):
+      +0.001 · (my_ships - max_enemy_ships) / 10  (ship-diff standing)
+      +0.05 · new_captures × (500-t)/500          (phase-weighted: early > late)
+      -0.05 · Δmy_planets_lost_to_enemy           (hostile flip penalty)
+      +0.15 · elim_bonus_this_step                (weak enemy eliminated)
     """
     shaped = [0.0]
-    prev = {}
+    n_agents = len(env_steps[0]) if env_steps else 0
     for t in range(1, len(env_steps)):
         prev_obs = env_steps[t-1][0].observation
         cur_obs = env_steps[t][0].observation
@@ -77,17 +86,19 @@ def compute_shaped_rewards(env_steps, seat: int) -> list[float]:
         pf = list(prev_obs.get("fleets") or [])
         cf = list(cur_obs.get("fleets") or [])
 
+        # Planet counts and production (existing)
         p_n = sum(1 for p in pp if p[1] == seat)
         c_n = sum(1 for p in cp if p[1] == seat)
         p_prod = sum(p[6] for p in pp if p[1] == seat)
         c_prod = sum(p[6] for p in cp if p[1] == seat)
-        # Enemy total ships (planets + fleets, non-me non-neutral)
+
+        # Enemy totals (planets + fleets), existing
         p_enemy = sum(p[5] for p in pp if p[1] != seat and p[1] != -1) + sum(
             f[6] for f in pf if f[1] != seat)
         c_enemy = sum(p[5] for p in cp if p[1] != seat and p[1] != -1) + sum(
             f[6] for f in cf if f[1] != seat)
 
-        # Sun-kill: my fleet present at t-1, gone at t, and was within 15 of sun
+        # Sun-kill (existing)
         pf_ids = {f[0]: f for f in pf if f[1] == seat}
         cf_ids = {f[0] for f in cf if f[1] == seat}
         sun_lost = 0
@@ -97,11 +108,61 @@ def compute_shaped_rewards(env_steps, seat: int) -> list[float]:
                 if d < 15.0:
                     sun_lost += f[6]
 
+        # -------- lb-1200 inspired --------
+        # Ship-diff standing (absolute, not delta) — drives persistent lead
+        my_ships_cur = sum(p[5] for p in cp if p[1] == seat) + sum(
+            f[6] for f in cf if f[1] == seat)
+        # Max enemy ship total (per-player)
+        enemy_totals = {}
+        for p in cp:
+            if p[1] not in (-1, seat):
+                enemy_totals[p[1]] = enemy_totals.get(p[1], 0) + p[5]
+        for f in cf:
+            if f[1] != seat:
+                enemy_totals[f[1]] = enemy_totals.get(f[1], 0) + f[6]
+        max_enemy_ships = max(enemy_totals.values()) if enemy_totals else 0
+        ship_diff_term = (my_ships_cur - max_enemy_ships) / 1000.0  # normalized
+
+        # Phase-weighted new captures + hostile-flip-away losses
+        prev_owner = {p[0]: p[1] for p in pp}
+        cur_owner = {p[0]: p[1] for p in cp}
+        new_captures = 0
+        lost_to_enemy = 0
+        for pid, co in cur_owner.items():
+            po = prev_owner.get(pid)
+            if po is None:
+                continue
+            if po != seat and co == seat:
+                new_captures += 1
+            if po == seat and co != seat and co != -1:
+                lost_to_enemy += 1
+        phase_weight = (TOTAL_STEPS - t) / TOTAL_STEPS
+
+        # Elimination bonus: count living opponents drops this step
+        def _living(obs_planets, obs_fleets):
+            alive = set()
+            for pl in obs_planets:
+                if pl[1] != -1 and pl[1] != seat:
+                    alive.add(pl[1])
+            for fl in obs_fleets:
+                if fl[1] != seat:
+                    alive.add(fl[1])
+            return alive
+        p_alive = _living(pp, pf)
+        c_alive = _living(cp, cf)
+        elim_count = max(0, len(p_alive) - len(c_alive))
+
         dr = (
+            # Original
             0.10 * (c_n - p_n)
             + 0.02 * (c_prod - p_prod)
             - 0.10 * sun_lost / 100.0
-            + 0.05 * max(0, p_enemy - c_enemy) / 100.0
+            + 0.10 * max(0, p_enemy - c_enemy) / 50.0
+            # lb-1200 inspired
+            + 0.001 * ship_diff_term * 10.0           # ship-diff standing
+            + 0.05 * new_captures * phase_weight       # phase-weighted captures
+            - 0.05 * lost_to_enemy                     # hostile flip penalty
+            + 0.15 * elim_count                        # eliminate opponent bonus
         )
         shaped.append(max(-1.0, min(1.0, dr)))
     return shaped
@@ -226,11 +287,15 @@ def pad_stack(samples, max_planets=64, max_fleets=64):
     P = min(max_planets, max(s["planets"].shape[0] for s in samples))
     FN = min(max_fleets, max(max(1, s["fleets"].shape[0]) for s in samples))
     B = len(samples)
-    planets = np.zeros((B, P, 14), dtype=np.float32)
+    planet_dim = samples[0]["planets"].shape[1]
+    planets = np.zeros((B, P, planet_dim), dtype=np.float32)
     planet_mask = np.zeros((B, P), dtype=bool)
-    fleets = np.zeros((B, FN, 9), dtype=np.float32)
+    fleet_dim = next((s["fleets"].shape[1] for s in samples
+                      if s["fleets"].shape[0] > 0), 10)
+    fleets = np.zeros((B, FN, fleet_dim), dtype=np.float32)
     fleet_mask = np.zeros((B, FN), dtype=bool)
-    globals_ = np.zeros((B, 16), dtype=np.float32)
+    global_dim = samples[0]["globals"].shape[0]
+    globals_ = np.zeros((B, global_dim), dtype=np.float32)
     for i, s in enumerate(samples):
         N = min(s["planets"].shape[0], P)
         planets[i, :N] = s["planets"][:N]
@@ -307,9 +372,26 @@ def impala_train_step(model, teacher, optimizer, samples,
     tgt_labels = ft + 1
     logp_tgt = F.log_softmax(picked_tgt, dim=-1).gather(1, tgt_labels.unsqueeze(1)).squeeze(1)
     logp_bkt = F.log_softmax(picked_bkt, dim=-1).gather(1, fk.unsqueeze(1)).squeeze(1)
-    logp = logp_tgt + 0.5 * logp_bkt
+    logp = logp_tgt + logp_bkt
     adv_per_label = advantage[fb]
-    policy_loss = -(adv_per_label * logp).mean()
+
+    # V-trace-lite (truncated importance sampling): rho = pi_new/pi_old,
+    # clipped to [0, 1] per IMPALA. If a sample has no stored behavior
+    # log-prob (legacy rollouts) treat rho=1 (on-policy fallback).
+    logp_behavior = torch.tensor(
+        [float(s.get("_logp_behavior", 0.0)) for s in samples],
+        dtype=torch.float32,
+    )
+    # Per-sample behavior log-prob broadcast to per-label (same sample index)
+    logp_b_per_label = logp_behavior[fb]
+    # Sum the per-label new logp within each sample to compare to behavior logp
+    # (behavior logp is joint for that sample's acting step). Use detached new.
+    with torch.no_grad():
+        per_sample_new_logp = torch.zeros_like(logp_behavior)
+        per_sample_new_logp.index_add_(0, fb, logp.detach())
+        rho = torch.exp(per_sample_new_logp - logp_behavior).clamp(max=1.0)
+    rho_per_label = rho[fb]
+    policy_loss = -(rho_per_label * adv_per_label * logp).mean()
 
     value_loss = 0.5 * (value - returns).pow(2).mean()
 

@@ -40,7 +40,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from kaggle_environments.envs.orbit_wars.orbit_wars import random_agent
+from kaggle_environments.envs.orbit_wars.orbit_wars import random_agent, starter_agent
 
 from training.model import OrbitAgent
 from training.agent import _encode_obs, SHIPS_BUCKETS
@@ -98,14 +98,17 @@ def _worker_init(model_kwargs: dict, teacher_state):
 
 
 def _pick_opponent_types(n_players: int, lb928_prob: float,
-                         random_opp_prob: float) -> list[str]:
-    """Per-seat: 'self', 'lb928', or 'random'. At least 1 self guaranteed."""
+                         random_opp_prob: float,
+                         starter_prob: float = 0.0) -> list[str]:
+    """Per-seat: 'self' / 'lb928' / 'starter' / 'random'. At least 1 self."""
     types = []
     for _ in range(n_players):
         r = random.random()
         if r < lb928_prob:
             types.append("lb928")
-        elif r < lb928_prob + random_opp_prob:
+        elif r < lb928_prob + starter_prob:
+            types.append("starter")
+        elif r < lb928_prob + starter_prob + random_opp_prob:
             types.append("random")
         else:
             types.append("self")
@@ -126,9 +129,11 @@ def _worker_play(task: dict) -> dict:
     opp_temp = task["opp_temp"]
     lb928_prob = task["lb928_prob"]
     random_opp_prob = task["random_opp_prob"]
+    starter_prob = task.get("starter_prob", 0.0)
     planet_action_noise = task["planet_action_noise"]
 
-    seat_types = _pick_opponent_types(n_players, lb928_prob, random_opp_prob)
+    seat_types = _pick_opponent_types(n_players, lb928_prob, random_opp_prob,
+                                      starter_prob=starter_prob)
 
     env = make("orbit_wars", debug=False)
     env.reset(num_agents=n_players)
@@ -138,8 +143,12 @@ def _worker_play(task: dict) -> dict:
     init_ids = {int(p[0]) for p in init_planets}
     comet_ids: set = set()
 
+    logp_by_seat_step: dict[int, dict[int, float]] = {s: {} for s in range(n_players)}
+
     while not env.done:
         actions: list = [None] * n_players
+        # Physics aim context (lb-1200 borrow): compute orbit-aware intercept
+        # angles inside sample_joint_action, with sun-blocker avoidance.
         step_obs0 = env.state[0].observation
         step_comets = list(step_obs0.get("comets") or [])
         for p in list(step_obs0.get("planets") or []):
@@ -155,16 +164,22 @@ def _worker_play(task: dict) -> dict:
             obs = _shared_obs(env, seat)
             if seat_types[seat] == "self":
                 tl, bl, _, planets_raw, pids, omask = _forward_policy(model, obs)
-                _sub, m, _ = sample_joint_action(
+                _sub, m, lp = sample_joint_action(
                     tl, bl, planets_raw, omask,
                     temperature=opp_temp,
                     planet_action_noise=planet_action_noise,
                     physics_aim_ctx=physics_ctx,
                 )
                 actions[seat] = m
+                logp_by_seat_step[seat][len(env.steps)] = float(lp)
             elif seat_types[seat] == "lb928":
                 try:
                     actions[seat] = lb928_agent_fn(obs) or []
+                except Exception:
+                    actions[seat] = []
+            elif seat_types[seat] == "starter":
+                try:
+                    actions[seat] = starter_agent(obs) or []
                 except Exception:
                     actions[seat] = []
             else:  # random
@@ -204,9 +219,45 @@ def _worker_play(task: dict) -> dict:
                                   init_planets, comet_ids)
             feat["_seat"] = seat
             feat["_t"] = t
+            feat["_logp_behavior"] = float(
+                logp_by_seat_step.get(seat, {}).get(t, 0.0))
             records[seat].append(feat)
 
-    rewards = [s.reward if s.reward is not None else 0 for s in env.state]
+    # ---- Continuous terminal reward (non-binary) + beat-rule bonus ----
+    # tanh((my_score - max_other_score) / CONT_SCALE) gives gradient even when
+    # self always loses. On top of that, add a bonus when a self seat is the
+    # winner in a game that contained a rule-based opponent (starter or lb928).
+    CONT_SCALE = 200.0
+    beat_starter_bonus = float(task.get("beat_starter_bonus", 0.5))
+    beat_lb928_bonus = float(task.get("beat_lb928_bonus", 1.0))
+    final_step = env.steps[-1] if env.steps else None
+    if final_step is not None:
+        fobs = final_step[0].observation
+        fplanets = list(fobs.get("planets") or [])
+        ffleets = list(fobs.get("fleets") or [])
+        scores = [0] * n_players
+        for p in fplanets:
+            if p[1] != -1 and 0 <= p[1] < n_players:
+                scores[p[1]] += p[5]
+        for f in ffleets:
+            if 0 <= f[1] < n_players:
+                scores[f[1]] += f[6]
+        max_r = max(scores) if scores else 0
+        has_starter = any(t == "starter" for t in seat_types)
+        has_lb928 = any(t == "lb928" for t in seat_types)
+        rewards = []
+        for s in range(n_players):
+            others = [scores[o] for o in range(n_players) if o != s]
+            max_other = max(others) if others else 0
+            base = float(math.tanh((scores[s] - max_other) / CONT_SCALE))
+            if scores[s] == max_r and seat_types[s] == "self":
+                if has_starter:
+                    base += beat_starter_bonus
+                if has_lb928:
+                    base += beat_lb928_bonus
+            rewards.append(base)
+    else:
+        rewards = [s.reward if s.reward is not None else 0 for s in env.state]
     gamma = 0.997
     for seat in records.keys():
         shaped = compute_shaped_rewards(env.steps, seat)
@@ -221,11 +272,12 @@ def _worker_play(task: dict) -> dict:
             feat["_shape_return"] = G[t]
             feat["_terminal_reward"] = float(rewards[seat])
 
-    seat_type_counts = {k: seat_types.count(k) for k in ("self", "lb928", "random")}
+    seat_type_counts = {k: seat_types.count(k)
+                        for k in ("self", "lb928", "starter", "random")}
 
     # Per-type winners (a game may have ties at max reward → multiple winners)
     max_r = max(rewards)
-    type_wins = {"self": 0, "lb928": 0, "random": 0}
+    type_wins = {"self": 0, "lb928": 0, "starter": 0, "random": 0}
     for s, rr in enumerate(rewards):
         if rr == max_r:
             type_wins[seat_types[s]] += 1
@@ -251,6 +303,17 @@ def main() -> int:
     ap.add_argument("--four-player-prob", type=float, default=0.5)
     ap.add_argument("--lb928-prob", type=float, default=0.1,
                     help="Probability any non-learner seat is lb-928")
+    ap.add_argument("--starter-prob", type=float, default=0.0,
+                    help="Probability any non-learner seat is starter (used when starter-prob-start==-1)")
+    ap.add_argument("--starter-prob-start", type=float, default=-1.0,
+                    help="Schedule start for starter-prob; if -1 use fixed --starter-prob")
+    ap.add_argument("--starter-prob-end", type=float, default=0.5)
+    ap.add_argument("--starter-decay-iters", type=int, default=30,
+                    help="Iters over which starter-prob linearly ramps start→end")
+    ap.add_argument("--beat-starter-bonus", type=float, default=0.5,
+                    help="Extra terminal reward when self wins a game with starter seat")
+    ap.add_argument("--beat-lb928-bonus", type=float, default=1.0,
+                    help="Extra terminal reward when self wins a game with lb928 seat")
     ap.add_argument("--random-opp-prob", type=float, default=0.06,
                     help="Probability a non-learner seat is random (starting value)")
     ap.add_argument("--random-opp-end", type=float, default=0.0,
@@ -265,6 +328,8 @@ def main() -> int:
     ap.add_argument("--ent-low", type=float, default=0.005)
     ap.add_argument("--ent-switch-iter", type=int, default=30)
     ap.add_argument("--shape-decay-iters", type=int, default=50)
+    ap.add_argument("--shape-weight-end", type=float, default=0.0,
+                    help="Floor value for shape_weight after decay (default 0)")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--grad-steps-per-iter", type=int, default=2)
     ap.add_argument("--snapshot-every", type=int, default=10,
@@ -318,6 +383,8 @@ def main() -> int:
               "self_seats", "lb928_seats", "random_seats",
               "self_wins", "lb928_wins", "random_wins",
               "vs928_games", "vs928_self_wins", "vs928_lb928_wins",
+              "vs_starter_games", "vs_starter_self_wins", "vs_starter_starter_wins",
+              "starter_seats", "starter_wins",
               "shape_weight", "entropy_coef", "temperature",
               "n_samples", "n_labels",
               "mean_term_r", "mean_shape_r",
@@ -332,6 +399,12 @@ def main() -> int:
     ent_sched = StepSchedule(args.ent_high, args.ent_low, args.ent_switch_iter)
     random_opp_sched = LinearSchedule(args.random_opp_prob, args.random_opp_end,
                                       args.random_opp_decay_iters)
+    if args.starter_prob_start >= 0:
+        starter_sched = LinearSchedule(args.starter_prob_start,
+                                       args.starter_prob_end,
+                                       args.starter_decay_iters)
+    else:
+        starter_sched = (lambda _it, v=args.starter_prob: v)
 
     mp.set_start_method("spawn", force=True)
     pool = mp.Pool(args.workers, initializer=_worker_init,
@@ -351,12 +424,14 @@ def main() -> int:
     try:
         for it in range(args.iters):
             t0 = time.time()
-            shape_w = max(0.0, 1.0 - it / max(1, args.shape_decay_iters))
+            shape_decay = max(0.0, 1.0 - it / max(1, args.shape_decay_iters))
+            shape_w = args.shape_weight_end + (1.0 - args.shape_weight_end) * shape_decay
             temp_t = temp_sched(it)
             ent_coef_t = ent_sched(it)
 
             state_bytes = serialize_state(model)
             random_opp_t = random_opp_sched(it)
+            starter_t = starter_sched(it) if callable(starter_sched) else starter_sched
             tasks = []
             for _ in range(args.workers):
                 n_players = 4 if random.random() < args.four_player_prob else 2
@@ -365,17 +440,21 @@ def main() -> int:
                     "n_players": n_players,
                     "opp_temp": temp_t,
                     "lb928_prob": args.lb928_prob,
+                    "starter_prob": starter_t,
                     "random_opp_prob": random_opp_t,
                     "planet_action_noise": args.planet_action_noise,
+                    "beat_starter_bonus": args.beat_starter_bonus,
+                    "beat_lb928_bonus": args.beat_lb928_bonus,
                 })
             results = pool.map(_worker_play, tasks)
 
             all_samples = []
             total_steps = 0
             seat_win_counts: dict[int, int] = defaultdict(int)
-            self_seats = lb928_seats = random_seats = 0
-            self_wins = lb928_wins = random_wins = 0
+            self_seats = lb928_seats = starter_seats = random_seats = 0
+            self_wins = lb928_wins = starter_wins = random_wins = 0
             vs928_games = vs928_self_wins = vs928_lb928_wins = 0
+            vs_st_games = vs_st_self_wins = vs_st_starter_wins = 0
             for r in results:
                 total_steps += r["steps"]
                 mx = max(r["rewards"])
@@ -385,20 +464,28 @@ def main() -> int:
                 c = r["seat_type_counts"]
                 self_seats += c["self"]
                 lb928_seats += c["lb928"]
+                starter_seats += c.get("starter", 0)
                 random_seats += c["random"]
                 tw = r["type_wins"]
                 self_wins += tw["self"]
                 lb928_wins += tw["lb928"]
+                starter_wins += tw.get("starter", 0)
                 random_wins += tw["random"]
+                winner_types = {r["seat_types"][s]
+                                for s, rr in enumerate(r["rewards"])
+                                if rr == mx}
                 if "lb928" in r["seat_types"]:
                     vs928_games += 1
-                    winner_types = {r["seat_types"][s]
-                                    for s, rr in enumerate(r["rewards"])
-                                    if rr == mx}
                     if "self" in winner_types:
                         vs928_self_wins += 1
                     if "lb928" in winner_types:
                         vs928_lb928_wins += 1
+                if "starter" in r["seat_types"]:
+                    vs_st_games += 1
+                    if "self" in winner_types:
+                        vs_st_self_wins += 1
+                    if "starter" in winner_types:
+                        vs_st_starter_wins += 1
                 for seat, recs in r["records"].items():
                     all_samples.extend(recs)
 
@@ -435,6 +522,11 @@ def main() -> int:
                 "vs928_games": vs928_games,
                 "vs928_self_wins": vs928_self_wins,
                 "vs928_lb928_wins": vs928_lb928_wins,
+                "vs_starter_games": vs_st_games,
+                "vs_starter_self_wins": vs_st_self_wins,
+                "vs_starter_starter_wins": vs_st_starter_wins,
+                "starter_seats": starter_seats,
+                "starter_wins": starter_wins,
                 "shape_weight": round(shape_w, 3),
                 "entropy_coef": round(ent_coef_t, 4),
                 "temperature": round(temp_t, 3),
@@ -455,10 +547,11 @@ def main() -> int:
 
             print(f"[iter {it:03d}/{args.iters}] {dt:.1f}s  "
                   f"wins[s/l/r]={self_wins}/{lb928_wins}/{random_wins}  "
-                  f"seats[s/l/r]={self_seats}/{lb928_seats}/{random_seats}  "
+                  f"seats[s/l/st/r]={self_seats}/{lb928_seats}/{starter_seats}/{random_seats}  "
                   f"vs928={vs928_self_wins}/{vs928_games}(lb={vs928_lb928_wins})  "
+                  f"vs_st={vs_st_self_wins}/{vs_st_games}(st={vs_st_starter_wins})  "
                   f"shape_w={shape_w:.2f} T={temp_t:.2f} "
-                  f"ent_c={ent_coef_t:.3f} rnd={random_opp_t:.3f}  "
+                  f"ent_c={ent_coef_t:.3f} rnd={random_opp_t:.3f} st={starter_t:.2f}  "
                   f"term_r={mean_term_r:+.3f} shape_r={mean_shape_r:+.3f}  "
                   f"loss={row['loss']}  pol={row['policy_loss']}  "
                   f"val={row['value_loss']}  ent={row['entropy']}  "
