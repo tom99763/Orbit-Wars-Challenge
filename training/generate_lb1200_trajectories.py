@@ -23,8 +23,11 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from featurize import featurize_step
-from training.lb928_agent import agent as lb1200_agent
+import collections
+
+from featurize import (featurize_step, nearest_target_index, ship_bucket_idx,
+                       HISTORY_K, PLANET_DIM, FLEET_DIM, GLOBAL_DIM)
+from training.lb1200_agent import agent as lb1200_agent
 
 
 GAMMA = 0.997
@@ -130,11 +133,18 @@ def run_episode(args) -> list[dict]:
         planet_ids_arr = np.empty((T,), dtype=object)
         planet_xy_arr = np.empty((T,), dtype=object)
         fleets_arr = np.empty((T,), dtype=object)
-        globals_arr = np.zeros((T, 16), dtype=np.float32)
+        globals_arr = np.zeros((T, GLOBAL_DIM), dtype=np.float32)
         owned_arr = np.empty((T,), dtype=object)
         src_arr = np.empty((T,), dtype=object)
         tgt_arr = np.empty((T,), dtype=object)
         bkt_arr = np.empty((T,), dtype=object)
+
+        # Per-seat sliding-window state (mirrors online_imitation.py / agent_v4.py).
+        obs_history = collections.deque(maxlen=HISTORY_K)
+        action_history = collections.deque(maxlen=HISTORY_K)
+        last_actions_by_planet: dict = {}
+        cumulative_stats = {"total_ships_sent": 0, "total_actions": 0}
+
         for t, s in enumerate(steps):
             step_dict = {
                 "step": s["step"],
@@ -151,8 +161,39 @@ def run_episode(args) -> list[dict]:
                                           if p[1] != seat and p[1] != -1),
                 "neutral_planet_count": sum(1 for p in s["planets"] if p[1] == -1),
             }
-            feat = featurize_step(step_dict, seat, ang_vel, n_players,
-                                  init_planets, comet_ids)
+            feat = featurize_step(
+                step_dict, seat, ang_vel, n_players, init_planets, comet_ids,
+                last_actions_by_planet=last_actions_by_planet,
+                cumulative_stats=cumulative_stats,
+                obs_history=list(obs_history),
+                action_history=list(action_history),
+            )
+            # Update history AFTER featurizing (featurize sees history up to t-1).
+            actions = s["_per_seat_action"][seat] or []
+            for mv in actions:
+                if len(mv) != 3:
+                    continue
+                from_id, angle, ships = mv
+                src_p = None
+                for pp in s["planets"]:
+                    if int(pp[0]) == int(from_id):
+                        src_p = pp
+                        break
+                if src_p is None:
+                    continue
+                tgt_i = nearest_target_index(src_p, angle, s["planets"])
+                tgt_pid = int(s["planets"][tgt_i][0]) if tgt_i is not None else -1
+                garrison = int(src_p[5]) + int(ships)
+                bkt_idx = ship_bucket_idx(int(ships), max(1, garrison))
+                prev = last_actions_by_planet.get(int(from_id), (-1, 0, -1, 0))
+                last_actions_by_planet[int(from_id)] = (
+                    tgt_pid, bkt_idx, int(s["step"]), prev[3] + 1)
+                cumulative_stats["total_ships_sent"] += int(ships)
+                cumulative_stats["total_actions"] += 1
+                action_history.append(
+                    (int(from_id), tgt_pid, bkt_idx, int(s["step"])))
+            # Obs history: shared per step (obs is shared in orbit-wars)
+            obs_history.append({"planets": s["planets"], "step": s["step"]})
             planets_arr[t] = feat["planets"]
             planet_ids_arr[t] = feat["planet_ids"]
             planet_xy_arr[t] = feat["planet_xy"]

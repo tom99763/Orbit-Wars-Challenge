@@ -19,7 +19,7 @@ $PY training/online_imitation.py \
     --target-games 20000 --workers 8 --four-player-prob 0.5 \
     --out "$CKPT_DATED" \
     --lr 3e-4 --batch 128 --grad-steps-per-iter 4 \
-    --buffer-size 5000 --snapshot-every 50 \
+    --buffer-size 5000 --snapshot-every 10 \
     >> "$LOG" 2>&1
 RC=$?
 if [ $RC -ne 0 ] || [ ! -f "$CKPT_DATED" ]; then

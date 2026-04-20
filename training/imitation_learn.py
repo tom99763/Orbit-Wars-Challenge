@@ -25,6 +25,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from training.model import OrbitAgent
+from featurize import PLANET_DIM, FLEET_DIM, GLOBAL_DIM
 
 
 class ILStepDataset(torch.utils.data.Dataset):
@@ -77,7 +78,7 @@ class ILStepDataset(torch.utils.data.Dataset):
             "planets": planets.astype(np.float32),
             "planet_xy": planet_xy.astype(np.float32),
             "fleets": fleets.astype(np.float32) if len(fleets)
-                      else np.zeros((0, 9), dtype=np.float32),
+                      else np.zeros((0, FLEET_DIM), dtype=np.float32),
             "globals": globals_.astype(np.float32),
             "owned_mask": owned.astype(bool),
             "src": src, "tgt": tgt, "bkt": bkt,
@@ -97,7 +98,7 @@ def collate(batch):
     pl = np.zeros((B, P, planet_dim), dtype=np.float32)
     xy = np.zeros((B, P, 2), dtype=np.float32)
     pmask = np.zeros((B, P), dtype=bool)
-    fl = np.zeros((B, Fmax, 9), dtype=np.float32)
+    fl = np.zeros((B, Fmax, FLEET_DIM), dtype=np.float32)
     fmask = np.zeros((B, Fmax), dtype=bool)
     gl = np.zeros((B, g_dim), dtype=np.float32)
     owned_mask = np.zeros((B, P), dtype=bool)
