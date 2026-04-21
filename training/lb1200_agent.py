@@ -28,7 +28,18 @@ TOTAL_WAR_REMAINING_TURNS = 38
 
 SAFE_NEUTRAL_MARGIN = 2
 CONTESTED_NEUTRAL_MARGIN = 2
-INTERCEPT_TOLERANCE = 1
+INTERCEPT_TOLERANCE = 1   # default for static planets
+
+def _tol_for(target, initial_by_id, comet_ids):
+    """Exact tolerance (0) for moving targets, loose (1) for static."""
+    if target.id in comet_ids:
+        return 0
+    init = initial_by_id.get(target.id)
+    if init is None:
+        return INTERCEPT_TOLERANCE
+    import math as _math
+    r = _math.sqrt((init.x - 50.0)**2 + (init.y - 50.0)**2)
+    return 0 if r + init.radius < ROTATION_LIMIT else INTERCEPT_TOLERANCE
 
 SAFE_OPENING_PROD_THRESHOLD = 4
 SAFE_OPENING_TURN_LIMIT = 10
@@ -344,6 +355,7 @@ def target_can_move(target, initial_by_id, comet_ids):
 
 
 def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, comet_ids):
+    tol = _tol_for(target, initial_by_id, comet_ids)
     best = None
     best_score = None
     max_turns = min(HORIZON, ROUTE_SEARCH_HORIZON)
@@ -360,7 +372,7 @@ def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, co
         if est is None:
             continue
         _, turns = est
-        if abs(turns - candidate_turns) > INTERCEPT_TOLERANCE:
+        if abs(turns - candidate_turns) > tol:
             continue
 
         actual_turns = max(turns, candidate_turns)
@@ -377,7 +389,7 @@ def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, co
             continue
 
         delta = abs(confirm[1] - actual_turns)
-        if delta > INTERCEPT_TOLERANCE:
+        if delta > tol:
             continue
 
         score = (delta, confirm[1], candidate_turns)
@@ -389,6 +401,7 @@ def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, co
 
 
 def aim_with_prediction(src, target, ships, initial_by_id, ang_vel, comets, comet_ids):
+    tol = _tol_for(target, initial_by_id, comet_ids)
     est = estimate_arrival(src.x, src.y, src.radius, target.x, target.y, target.radius, ships)
     if est is None:
         if not target_can_move(target, initial_by_id, comet_ids):
@@ -398,7 +411,7 @@ def aim_with_prediction(src, target, ships, initial_by_id, ang_vel, comets, come
         )
 
     tx, ty = target.x, target.y
-    for _ in range(5):
+    for _ in range(12):
         _, turns = est
         pos = predict_target_position(target, turns, initial_by_id, ang_vel, comets, comet_ids)
         if pos is None:
@@ -412,20 +425,18 @@ def aim_with_prediction(src, target, ships, initial_by_id, ang_vel, comets, come
                 src, target, ships, initial_by_id, ang_vel, comets, comet_ids,
             )
         if (
-            abs(ntx - tx) < 0.3
-            and abs(nty - ty) < 0.3
-            and abs(next_est[1] - turns) <= INTERCEPT_TOLERANCE
+            abs(ntx - tx) < 0.1
+            and abs(nty - ty) < 0.1
+            and abs(next_est[1] - turns) <= tol
         ):
             return next_est[0], next_est[1], ntx, nty
         tx, ty = ntx, nty
         est = next_est
 
-    final_est = estimate_arrival(src.x, src.y, src.radius, tx, ty, target.radius, ships)
-    if final_est is None:
-        return search_safe_intercept(
-            src, target, ships, initial_by_id, ang_vel, comets, comet_ids,
-        )
-    return final_est[0], final_est[1], tx, ty
+    # Refinement did not converge — fall back to exhaustive intercept search
+    return search_safe_intercept(
+        src, target, ships, initial_by_id, ang_vel, comets, comet_ids,
+    )
 
 # ============================================================
 # World Model
