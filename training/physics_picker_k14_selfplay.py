@@ -128,7 +128,8 @@ def _nn_sample_action(net: DualStreamK13Agent, obs: dict, my_player: int,
         return [], None
 
     step_dict = {
-        "step": 0, "planets": raw_planets, "fleets": raw_fleets,
+        "step": int(obs.get("step", 0) or 0),
+        "planets": raw_planets, "fleets": raw_fleets,
         "action": [],
         "my_total_ships": sum(p[5] for p in raw_planets if p[1] == my_player),
         "enemy_total_ships": 0, "my_planet_count": 0,
@@ -197,11 +198,14 @@ def _nn_sample_action(net: DualStreamK13Agent, obs: dict, my_player: int,
 
     sample_dict = None
     if want_logprob and picks:
+        # Normalize log_prob by number of decisions (1 per pass pick, 2 per non-pass pick)
+        # to prevent trajectory-level ratio from exploding with many planets
+        n_decisions = sum(2 if p[1] != 0 else 1 for p in picks)
         sample_dict = {
             "feat": feat, "spatial": spatial,
             "planet_ids": planet_ids_in_feat,
             "picks": picks,
-            "log_prob_sum": log_prob_sum,
+            "log_prob_sum": log_prob_sum / max(1, n_decisions),
             "entropy": ent_sum / max(1, ent_ct),
             "value": float(v.item()),
             "reward": 0.0,
@@ -518,9 +522,11 @@ def main():
     replay_buf: collections.deque = collections.deque(maxlen=args.replay_iters)
 
     for iter_ in range(1, args.target_iters + 1):
-        # Refresh worker pool with latest weights every 5 iters (skip iter 1 — pool just created)
-        if iter_ % 5 == 0:
-            worker_pool.close()
+        # Refresh worker pool with latest weights every 5 iters.
+        # Skip if this iter will also trigger eval (eval does its own refresh with updated weights).
+        is_eval_iter = (iter_ % args.eval_every == 0)
+        if iter_ % 5 == 0 and not is_eval_iter:
+            worker_pool.close(); worker_pool.join()
             worker_pool = ctx.Pool(processes=args.workers, initializer=_worker_init,
                                    initargs=(sdb(),))
 
@@ -599,7 +605,7 @@ def main():
         # Evaluation: every N iters, play vs error-free lb928 & lb1200
         if iter_ % args.eval_every == 0:
             # Refresh workers so they have the current policy before eval
-            worker_pool.close()
+            worker_pool.close(); worker_pool.join()
             worker_pool = ctx.Pool(processes=args.workers, initializer=_worker_init,
                                    initargs=(sdb(),))
             eval_tasks = []
@@ -616,7 +622,7 @@ def main():
             last_eval = {"vs928": w928, "vs1200": w1200, "wr": wr, "iter": iter_}
             print(f"[eval {iter_:04d}] vs928={w928}/{args.eval_games}  "
                   f"vs1200={w1200}/{args.eval_games}  wr={wr:.1%}  "
-                  f"mature={'YES' if mature else 'NO'}", flush=True)
+                  f"lb_active={'YES' if iter_ >= args.lb_start_iter else 'NO'}", flush=True)
             # lb schedule is now time-based (iter >= lb_start_iter), not eval-gated
 
     worker_pool.close(); worker_pool.join()

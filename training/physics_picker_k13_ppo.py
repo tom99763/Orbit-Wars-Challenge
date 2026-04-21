@@ -457,7 +457,7 @@ def _collate_batch(samples: list[dict], device: str) -> dict:
 
 
 def ppo_update(net, opt, samples, device, epochs=4, clip=0.2,
-               ent_coef=0.01, val_coef=0.5, val_clip=0.2, frac_ent_w=0.5):
+               ent_coef=0.01, val_coef=0.5, val_clip=0.2, frac_ent_w=1.5):
     if not samples: return {}
     batch = _collate_batch(samples, device)
     log_probs_old = batch["log_probs_old"]
@@ -499,7 +499,10 @@ def ppo_update(net, opt, samples, device, epochs=4, clip=0.2,
             sel_f = f_lp.gather(1, f_idx.unsqueeze(1)).squeeze(1)
             # Only add frac log-prob when mode != pass (mode_idx != 0)
             mask_not_pass = (m_idx != 0).float()
-            lp_i = (sel_m + mask_not_pass * sel_f).sum()
+            # Normalize by number of decisions to prevent trajectory ratio explosion
+            n_decs = float(mask_not_pass.sum().item() * 2 + (1 - mask_not_pass).sum().item())
+            n_decs = max(1.0, n_decs)
+            lp_i = (sel_m + mask_not_pass * sel_f).sum() / n_decs
             lp_list.append(lp_i)
             m_probs = m_lp.exp()
             f_probs = f_lp.exp()
