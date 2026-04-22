@@ -609,8 +609,8 @@ class OrbitWarsVecEnv:
                 int(p), int(self.pl_owner[eid, p]),
                 float(self.pl_x[eid, p]),  float(self.pl_y[eid, p]),
                 float(self.pl_radius[eid, p]),
-                float(self.pl_ships[eid, p]),
-                float(self.pl_prod[eid, p]),
+                int(round(self.pl_ships[eid, p])),
+                int(self.pl_prod[eid, p]),
             ])
         fleets = []
         active_idx = np.where(self.fl_active[eid])[0]
@@ -620,7 +620,7 @@ class OrbitWarsVecEnv:
                 s, int(self.fl_owner[eid, s]),
                 float(self.fl_x[eid, s]),    float(self.fl_y[eid, s]),
                 float(self.fl_angle[eid, s]), int(self.fl_from[eid, s]),
-                float(self.fl_ships[eid, s]),
+                int(round(self.fl_ships[eid, s])),
             ])
         initial_planets = []
         for p in range(self.NP):
@@ -628,8 +628,8 @@ class OrbitWarsVecEnv:
                 int(p), int(-1),
                 float(self.pl_init_x[eid, p]), float(self.pl_init_y[eid, p]),
                 float(self.pl_radius[eid, p]),
-                0.0,
-                float(self.pl_prod[eid, p]),
+                0,
+                int(self.pl_prod[eid, p]),
             ])
         comets = []
         active_c = np.where(self.c_active[eid])[0]
