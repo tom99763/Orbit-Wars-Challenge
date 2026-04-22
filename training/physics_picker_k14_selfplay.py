@@ -45,7 +45,8 @@ from training.dual_stream_model import rasterize_obs, N_SPATIAL_CHANNELS
 from training.lb1200_agent import build_world
 from training.physics_action_helper_k13 import (
     N_MODES, N_FRACS, MODE_NAMES, FRACTIONS,
-    materialize_joint_action, compute_mode_mask,
+    materialize_joint_action, materialize_with_targets, compute_mode_mask,
+    get_top_k_candidates, TOP_K_TARGETS, CAND_FEAT_DIM,
 )
 from training.physics_picker_k13_ppo import (
     DualStreamK13Agent, _collate_batch, ppo_update,
@@ -64,6 +65,7 @@ _worker_opp: Optional[DualStreamK13Agent] = None
 
 def _worker_init(main_sd_bytes: bytes):
     global _worker_main, _worker_opp
+    import os; os.environ["CUDA_VISIBLE_DEVICES"] = ""  # workers always on CPU
     torch.set_num_threads(2)   # limit per-worker threads to reduce CPU contention
     from kaggle_environments import make   # noqa
     _worker_main = DualStreamK13Agent(
@@ -164,6 +166,7 @@ def _nn_sample_action(net: DualStreamK13Agent, obs: dict, my_player: int,
     planet_ids_in_feat = feat.get("planet_ids", [])
 
     picks = []
+    committed = {}  # target_pid -> ships already dispatched this step (coordination)
     log_prob_sum = 0.0
     ent_sum = 0.0; ent_ct = 0
     for i, pid in enumerate(planet_ids_in_feat):
@@ -179,8 +182,28 @@ def _nn_sample_action(net: DualStreamK13Agent, obs: dict, my_player: int,
             log_prob_sum += float(np.log(m_p[mode_idx] + 1e-9))
             ent_sum += -float((m_p * np.log(m_p + 1e-9)).sum()); ent_ct += 1
         if mode_idx == 0:
-            picks.append((int(pid), 0, 0, tuple(mask)))
+            picks.append((int(pid), 0, 0, np.zeros((TOP_K_TARGETS, CAND_FEAT_DIM), dtype=np.float32), 0, 1, -1, tuple(mask)))
             continue
+
+        # Top-K target selection (with fleet race + coordination features)
+        cands, cand_feats, n_valid = get_top_k_candidates(
+            src, world, my_player, mode_idx,
+            fleets_raw=raw_fleets, committed=committed,
+        )
+        if n_valid == 0:
+            picks.append((int(pid), 0, 0, np.zeros((TOP_K_TARGETS, CAND_FEAT_DIM), dtype=np.float32), 0, 1, -1, tuple(mask)))
+            continue
+        cand_feats_t = torch.from_numpy(cand_feats).unsqueeze(0).to(fused_tokens.device)  # (1,K,d)
+        with torch.no_grad():
+            t_scores = net.target_logits_for(fused_tokens[0, i].unsqueeze(0), cand_feats_t)[0].cpu().numpy()  # (K,)
+        t_scores[n_valid:] = -1e9
+        t_p = np.exp(t_scores - t_scores[:n_valid].max()); t_p[n_valid:] = 0.0; t_p = t_p / t_p.sum()
+        tgt_idx = int(np.random.choice(TOP_K_TARGETS, p=t_p))
+        target_pid = cands[tgt_idx].id
+        if want_logprob:
+            log_prob_sum += float(np.log(t_p[tgt_idx] + 1e-9))
+            ent_sum += -float((t_p[:n_valid] * np.log(t_p[:n_valid] + 1e-9)).sum()); ent_ct += 1
+
         with torch.no_grad():
             fl_cond = net.frac_logits_for(
                 fused_tokens[0, i],
@@ -191,16 +214,22 @@ def _nn_sample_action(net: DualStreamK13Agent, obs: dict, my_player: int,
         if want_logprob:
             log_prob_sum += float(np.log(f_p[frac_idx] + 1e-9))
             ent_sum += -float((f_p * np.log(f_p + 1e-9)).sum()); ent_ct += 1
-        picks.append((int(pid), mode_idx, frac_idx, tuple(mask)))
 
-    action_list = materialize_joint_action(
-        [(p[0], p[1], p[2]) for p in picks], world, my_player)
+        # Update committed fleet budget for subsequent planet decisions
+        ships_sent = max(1, int(src.ships * FRACTIONS[frac_idx]))
+        committed[target_pid] = committed.get(target_pid, 0) + ships_sent
+
+        # (pid, mode_idx, frac_idx, cand_feats, tgt_idx, n_valid, target_pid, mask)
+        picks.append((int(pid), mode_idx, frac_idx, cand_feats, tgt_idx, n_valid, target_pid, tuple(mask)))
+
+    action_list = materialize_with_targets(
+        [(p[0], p[1], p[2], p[6]) for p in picks], world, my_player)
 
     sample_dict = None
     if want_logprob and picks:
         # Normalize log_prob by number of decisions (1 per pass pick, 2 per non-pass pick)
         # to prevent trajectory-level ratio from exploding with many planets
-        n_decisions = sum(2 if p[1] != 0 else 1 for p in picks)
+        n_decisions = sum(3 if p[1] != 0 else 1 for p in picks)
         sample_dict = {
             "feat": feat, "spatial": spatial,
             "planet_ids": planet_ids_in_feat,
@@ -249,7 +278,7 @@ def _rollout_game(task: dict) -> dict:
     samples = []
     ang_vel_init = None; init_planets = None
     step = 0
-    prev_prod_phi = 0.0; prev_ship_phi = 0.0; prev_planet_phi = 0.0
+    prev_prod_phi = 0.0; prev_ship_phi = 0.0; prev_enemy_ship_phi = 0.0
     mode_counts = [0] * N_MODES
     frac_counts = [0] * N_FRACS
 
@@ -274,7 +303,8 @@ def _rollout_game(task: dict) -> dict:
                 actions_all.append(action_list)
                 if smpl is not None:
                     samples.append(smpl)
-                    for pid, mi, fi, _ in smpl["picks"]:
+                    for p in smpl["picks"]:
+                        mi, fi = p[1], p[2]
                         mode_counts[mi] += 1
                         if mi != 0: frac_counts[fi] += 1
             else:
@@ -332,19 +362,20 @@ def _rollout_game(task: dict) -> dict:
             my_prod  = sum(p[6] for p in cur_planets if p[1] == picker_seat)
             tot_prod = sum(p[6] for p in cur_planets)
             prod_phi = my_prod / max(1, tot_prod)
-            my_ships  = sum(p[5] for p in cur_planets if p[1] == picker_seat)
-            my_ships += sum(f[6] for f in cur_fleets   if f[1] == picker_seat)
+            my_ships   = sum(p[5] for p in cur_planets if p[1] == picker_seat)
+            my_ships  += sum(f[6] for f in cur_fleets   if f[1] == picker_seat)
             tot_ships  = sum(p[5] for p in cur_planets) + sum(f[6] for f in cur_fleets)
-            ship_phi = my_ships / max(1, tot_ships)
-            my_planet_count = sum(1 for p in cur_planets if p[1] == picker_seat)
-            planet_phi = my_planet_count / max(1, len(cur_planets))
+            ship_phi   = my_ships / max(1, tot_ships)
+            enemy_ships  = sum(p[5] for p in cur_planets if p[1] != picker_seat and p[1] != -1)
+            enemy_ships += sum(f[6] for f in cur_fleets   if f[1] != picker_seat)
+            enemy_ship_phi = enemy_ships / max(1, tot_ships)
             r = ((prod_phi - GAMMA * prev_prod_phi)
-                 + 0.1 * (ship_phi - GAMMA * prev_ship_phi)
-                 + 0.2 * (planet_phi - GAMMA * prev_planet_phi))
+                 + 0.5 * (ship_phi       - GAMMA * prev_ship_phi)
+                 - 0.3 * (enemy_ship_phi - GAMMA * prev_enemy_ship_phi))
             samples[-1]["reward"] = r
-            prev_prod_phi = prod_phi
-            prev_ship_phi = ship_phi
-            prev_planet_phi = planet_phi
+            prev_prod_phi      = prod_phi
+            prev_ship_phi      = ship_phi
+            prev_enemy_ship_phi = enemy_ship_phi
 
     if samples:
         terminal = float(env.state[picker_seat].reward or 0)
@@ -487,6 +518,10 @@ def main():
     ap.add_argument("--noise-end-iter", type=int, default=500,
                     help="iter at which lb mistake rate reaches 0 (pure lb)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--resume", default=None,
+                    help="resume from a k14 checkpoint (overrides --warm-start-k12)")
+    ap.add_argument("--start-iter", type=int, default=1,
+                    help="starting iteration number (use with --resume)")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -494,7 +529,15 @@ def main():
         planet_dim=PLANET_DIM, fleet_dim=FLEET_DIM, global_dim=GLOBAL_DIM,
     ).to(device)
 
-    if args.warm_start_k12 and Path(args.warm_start_k12).exists():
+    if args.resume and Path(args.resume).exists():
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+        net.load_state_dict(sd, strict=False)
+        resume_iter = ckpt.get("iter", args.start_iter - 1) if isinstance(ckpt, dict) else args.start_iter - 1
+        print(f"[k14] resumed from {args.resume} (iter {resume_iter})", flush=True)
+        if args.start_iter == 1:
+            args.start_iter = resume_iter + 1
+    elif args.warm_start_k12 and Path(args.warm_start_k12).exists():
         loaded = load_k12_into_k13(net, args.warm_start_k12)
         print(f"[k14] warm-started {loaded} tensors from {args.warm_start_k12}", flush=True)
     init_head_biases(net)
@@ -521,7 +564,7 @@ def main():
     t0 = time.time()
     replay_buf: collections.deque = collections.deque(maxlen=args.replay_iters)
 
-    for iter_ in range(1, args.target_iters + 1):
+    for iter_ in range(args.start_iter, args.start_iter + args.target_iters):
         # Refresh worker pool with latest weights every 5 iters.
         # Skip if this iter will also trigger eval (eval does its own refresh with updated weights).
         is_eval_iter = (iter_ % args.eval_every == 0)

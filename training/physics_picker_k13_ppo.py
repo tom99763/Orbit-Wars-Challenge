@@ -103,6 +103,9 @@ class DualStreamK13Agent(nn.Module):
             nn.Linear(d_entity, d_entity), nn.GELU(),
             nn.Linear(d_entity, 1),
         )
+        # Target selection head: scores each of top-K candidates
+        from training.physics_action_helper_k13 import CAND_FEAT_DIM
+        self.target_head = nn.Linear(d_entity + CAND_FEAT_DIM, 1)
 
     def forward(self, planets, planet_mask, fleets, fleet_mask, globals_, spatial):
         B, P, _ = planets.shape
@@ -128,6 +131,18 @@ class DualStreamK13Agent(nn.Module):
         # NOTE: frac_logits NOT computed here — call frac_logits_for(fused, mode_idx)
         # to get [*, N_FRACS] conditioned on chosen mode.
         return fused_planet_tokens, mode_logits, value
+
+    def target_logits_for(self, fused_src, cand_feats):
+        """Score top-K target candidates.
+
+        fused_src:  (n_picks, d_entity)
+        cand_feats: (n_picks, K, CAND_FEAT_DIM)
+        returns:    (n_picks, K) logits
+        """
+        n, K, _ = cand_feats.shape
+        src_exp = fused_src.unsqueeze(1).expand(-1, K, -1)   # (n, K, d)
+        inp = torch.cat([src_exp, cand_feats], dim=-1)        # (n, K, d+CAND_FEAT_DIM)
+        return self.target_head(inp).squeeze(-1)              # (n, K)
 
     def frac_logits_for(self, fused_tokens, mode_idx):
         """Compute frac logits conditional on mode_idx.
@@ -161,11 +176,11 @@ def init_head_biases(net_k13):
     """Strong prior to break reinforce-collapse.
 
     mode prior (as logit bias):
-      pass     : -1.5  (strongly discourage idleness)
-      expand   : +1.5  (strongly prefer neutral grab = territory control)
-      attack   : +1.0  (encourage — ships-in-combat = PBRS planet gain)
-      reinforce: -2.0  (strongly suppress — was collapsing to 78%)
-      denial   : +0.5  (mildly encourage)
+      pass     : -2.0  (strongly discourage idleness)
+      expand   : +2.5  (very strongly prefer neutral grab)
+      attack   : +2.0  (very strongly encourage enemy attack)
+      reinforce: -3.0  (hard suppress — was collapsing at iter 100)
+      denial   : +1.0  (encourage strategic denial)
 
     fraction prior (prefer 50-80% — Shun_PI sweet spot):
       5%  : -0.5
@@ -178,7 +193,7 @@ def init_head_biases(net_k13):
       100%: -0.3
     """
     with torch.no_grad():
-        mode_bias = torch.tensor([-1.5, 1.5, 1.0, -2.0, 0.5])
+        mode_bias = torch.tensor([-2.0, 2.5, 2.0, -3.0, 1.0])
         frac_bias = torch.tensor([-0.5, -0.2, 0.0, 0.4, 0.4, 0.3, 0.0, -0.3])
         net_k13.mode_head.bias.copy_(mode_bias)
         net_k13.frac_head.bias.copy_(frac_bias)
@@ -429,10 +444,22 @@ def _collate_batch(samples: list[dict], device: str) -> dict:
         picks_j = []
         for p in s["picks"]:
             pid, mi, fi = p[0], p[1], p[2]
-            mask = p[3] if len(p) > 3 else (True,) * N_MODES
+            # New format: (pid, mi, fi, cand_feats, tgt_idx, n_valid, target_pid, mask)
+            # Old format: (pid, mi, fi, mask)
+            if len(p) >= 7:
+                cand_feats = p[3]   # (K, CAND_FEAT_DIM)
+                tgt_idx    = int(p[4])
+                n_valid    = int(p[5])
+                mask       = p[7] if len(p) > 7 else p[6]
+            else:
+                from training.physics_action_helper_k13 import TOP_K_TARGETS, CAND_FEAT_DIM as _CFD
+                cand_feats = np.zeros((TOP_K_TARGETS, _CFD), dtype=np.float32)
+                tgt_idx    = 0
+                n_valid    = 1
+                mask       = p[3] if len(p) > 3 else (True,) * N_MODES
             j = pid_to_idx.get(int(pid), -1)
             if j >= 0:
-                picks_j.append((j, int(mi), int(fi), mask))
+                picks_j.append((j, int(mi), int(fi), cand_feats, tgt_idx, n_valid, mask))
         pick_lists.append(picks_j)
 
     adv = returns - values
@@ -485,29 +512,40 @@ def ppo_update(net, opt, samples, device, epochs=4, clip=0.2,
             p_idx = torch.tensor([p[0] for p in picks_j], device=device, dtype=torch.long)
             m_idx = torch.tensor([p[1] for p in picks_j], device=device, dtype=torch.long)
             f_idx = torch.tensor([p[2] for p in picks_j], device=device, dtype=torch.long)
-            # Per-pick mode mask for consistency with rollout sampling
-            mode_mask = torch.tensor([[float(x) for x in p[3]] for p in picks_j],
-                                     device=device, dtype=torch.float32)  # [n_picks, N_MODES]
-            m_logits_pl = mode_logits[i, p_idx]   # [n_picks, N_MODES]
-            m_logits_pl = m_logits_pl + (1.0 - mode_mask) * (-1e9)  # mask invalid modes
-            # Conditional frac logits — same mode used at rollout time
+            cand_feats_np = np.stack([p[3] for p in picks_j])  # (n, K, CAND_FEAT_DIM)
+            t_idx = torch.tensor([p[4] for p in picks_j], device=device, dtype=torch.long)
+            n_valid = [p[5] for p in picks_j]
+            mode_mask = torch.tensor([[float(x) for x in p[6]] for p in picks_j],
+                                     device=device, dtype=torch.float32)
+            m_logits_pl = mode_logits[i, p_idx]
+            m_logits_pl = m_logits_pl + (1.0 - mode_mask) * (-1e9)
             fused_pl = fused_tokens[i, p_idx]     # [n_picks, d]
-            f_logits_pl = net.frac_logits_for(fused_pl, m_idx)  # [n_picks, N_FRACS]
+            f_logits_pl = net.frac_logits_for(fused_pl, m_idx)
+            # Target logits — mask padding positions beyond n_valid
+            cand_feats_t = torch.from_numpy(cand_feats_np).to(device)  # (n, K, CAND_FEAT_DIM)
+            t_logits = net.target_logits_for(fused_pl, cand_feats_t)   # (n, K)
+            K = t_logits.shape[1]
+            for ni, nv in enumerate(n_valid):
+                if nv < K:
+                    t_logits[ni, nv:] = -1e9
             m_lp = F.log_softmax(m_logits_pl, dim=-1)
             f_lp = F.log_softmax(f_logits_pl, dim=-1)
+            t_lp = F.log_softmax(t_logits, dim=-1)
             sel_m = m_lp.gather(1, m_idx.unsqueeze(1)).squeeze(1)
             sel_f = f_lp.gather(1, f_idx.unsqueeze(1)).squeeze(1)
-            # Only add frac log-prob when mode != pass (mode_idx != 0)
+            sel_t = t_lp.gather(1, t_idx.unsqueeze(1)).squeeze(1)
             mask_not_pass = (m_idx != 0).float()
-            # Normalize by number of decisions to prevent trajectory ratio explosion
-            n_decs = float(mask_not_pass.sum().item() * 2 + (1 - mask_not_pass).sum().item())
+            # non-pass = 3 decisions (mode + target + frac); pass = 1
+            n_decs = float(mask_not_pass.sum().item() * 3 + (1 - mask_not_pass).sum().item())
             n_decs = max(1.0, n_decs)
-            lp_i = (sel_m + mask_not_pass * sel_f).sum() / n_decs
+            lp_i = (sel_m + mask_not_pass * (sel_t + sel_f)).sum() / n_decs
             lp_list.append(lp_i)
             m_probs = m_lp.exp()
             f_probs = f_lp.exp()
+            t_probs = t_lp.exp()
             em_list.append(-(m_probs * m_lp).sum(dim=-1).mean())
-            ef_list.append(-(f_probs * f_lp).sum(dim=-1).mean())
+            ef_list.append(-(f_probs * f_lp).sum(dim=-1).mean() +
+                           -(t_probs * t_lp).sum(dim=-1).mean())
 
         lp_new = torch.stack(lp_list)
         em_mean = torch.stack(em_list).mean()

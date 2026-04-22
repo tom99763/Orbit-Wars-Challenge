@@ -27,7 +27,7 @@ NEW_FORWARD_TAIL = """            fused_p = planet_tokens + fused_g[:, None, :]
                     W['frac_head.weight'], W['frac_head.bias'])
                 for m in range(5)
             ], axis=2)
-            return mode_logits, frac_logits_all"""
+            return mode_logits, frac_logits_all, fused_p"""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. k14 helper functions inserted before _SESSION = None
@@ -54,8 +54,40 @@ def _k14_mode_mask(src, world, my_player):
             any_enemy and (have_neutral or have_enemy)]
 
 
-def _k14_find_target(src, world, my_player, mode):
-    """Pick best target planet for given mode; None if nothing reachable."""
+_K14_TOP_K = 4
+_K14_CAND_FEAT_DIM = 10
+_K14_FLEET_MAX_SPEED = 6.0
+_K14_MAX_ETA = 50.0 / _K14_FLEET_MAX_SPEED
+
+def _k14_fleet_arrivals(fleets_raw, planets, my_player):
+    arrivals = {}
+    if not fleets_raw:
+        return arrivals
+    for f in fleets_raw:
+        owner, fx, fy, fangle, fships = int(f[1]), float(f[2]), float(f[3]), float(f[4]), float(f[6])
+        spd = max(1.0 + 5.0 * (math.log(max(fships,1)) / math.log(1000))**1.5, 0.1)
+        spd = min(spd, 6.0)
+        dir_x = math.cos(fangle); dir_y = math.sin(fangle)
+        for p in planets:
+            dx = p.x - fx; dy = p.y - fy
+            proj = dx * dir_x + dy * dir_y
+            if proj <= 0: continue
+            perp_sq = dx*dx + dy*dy - proj*proj
+            r = getattr(p, 'radius', 1.5)
+            if perp_sq >= r * r: continue
+            eta = proj / spd
+            pid = p.id
+            if pid not in arrivals:
+                arrivals[pid] = [float('inf'), 0]
+            if owner != my_player:
+                if eta < arrivals[pid][0]: arrivals[pid][0] = eta
+            else:
+                arrivals[pid][1] += int(fships)
+            break
+    return arrivals
+
+def _k14_get_top_k(src, world, my_player, mode, fleets_raw=None, committed=None):
+    """Return (cands[:K], feats (K,10), n_valid) sorted by prod/(dist+1) desc."""
     planets = world.planets
     def reach(p):
         if p.id == src.id: return False
@@ -71,50 +103,62 @@ def _k14_find_target(src, world, my_player, mode):
         enemies = [p for p in planets if p.owner != my_player and p.owner != -1]
         cands = []
         for p in planets:
-            if p.owner == my_player or not reach(p):
-                continue
+            if p.owner == my_player or not reach(p): continue
             for e in enemies:
                 me_to_p = math.hypot(p.x - src.x, p.y - src.y)
                 p_to_e  = math.hypot(e.x - p.x,   e.y - p.y)
                 me_to_e = math.hypot(e.x - src.x, e.y - src.y) + 1e-6
                 if (me_to_p + p_to_e) - me_to_e < 15.0:
-                    cands.append(p)
-                    break
+                    cands.append(p); break
     else:
-        return None
+        return [], None, 0
     if not cands:
-        return None
-    if mode == 3:
-        cands.sort(key=lambda p: (p.ships, math.hypot(p.x - src.x, p.y - src.y)))
-    else:
-        cands.sort(key=lambda p: math.hypot(p.x - src.x, p.y - src.y))
-    return cands[0]
+        return [], None, 0
+    cands.sort(key=lambda p: p.production / (math.hypot(p.x - src.x, p.y - src.y) + 1.0),
+               reverse=True)
+    cands = cands[:_K14_TOP_K]
+    n_valid = len(cands)
+    arrivals = _k14_fleet_arrivals(fleets_raw, world.planets, my_player) if fleets_raw else {}
+    feats = np.zeros((_K14_TOP_K, _K14_CAND_FEAT_DIM), dtype=np.float32)
+    for ci, p in enumerate(cands):
+        dist = math.hypot(p.x - src.x, p.y - src.y)
+        is_static = 1.0 if math.hypot(p.x - 50.0, p.y - 50.0) >= 45.0 else 0.0
+        my_eta = dist / _K14_FLEET_MAX_SPEED
+        projected = min((p.ships + p.production * my_eta) / 200.0, 2.0)
+        arr = arrivals.get(p.id, [float('inf'), 0])
+        enemy_eta = arr[0] if arr[0] < float('inf') else _K14_MAX_ETA
+        friendly_ships = arr[1] + (committed.get(p.id, 0) if committed else 0)
+        race_margin = max(-1.0, min(1.0, (enemy_eta - my_eta) / _K14_MAX_ETA))
+        feats[ci] = [p.production / 5.0, dist / 50.0, p.ships / 200.0,
+                     is_static, (p.production / (dist + 1.0)) / 2.0,
+                     my_eta / _K14_MAX_ETA, projected,
+                     min(friendly_ships / 200.0, 1.0),
+                     min(enemy_eta / _K14_MAX_ETA, 1.0),
+                     race_margin]
+    return cands, feats, n_valid
 
 
 def _k14_materialize(picks, world, my_player):
-    """Given [(pid, mode_idx, frac_idx), ...], return env action list."""
+    """Given [(pid, mode_idx, frac_idx, target_pid), ...], return env action list."""
     planet_by_id = {p.id: p for p in world.planets}
     initial_by_id = getattr(world, 'initial_by_id', {})
-    ang_vel  = getattr(world, 'ang_vel', 0.0)
-    comets   = getattr(world, 'comets', []) or []
+    ang_vel   = getattr(world, 'ang_vel', 0.0)
+    comets    = getattr(world, 'comets', []) or []
     comet_ids = getattr(world, 'comet_ids', set())
     actions = []
-    for pid, mode, frac_idx in picks:
+    for item in picks:
+        pid, mode, frac_idx, target_pid = item
         src = planet_by_id.get(int(pid))
-        if src is None or src.owner != my_player or mode == 0:
-            continue
-        tgt = _k14_find_target(src, world, my_player, mode)
-        if tgt is None:
-            continue
+        if src is None or src.owner != my_player or mode == 0: continue
+        tgt = planet_by_id.get(int(target_pid))
+        if tgt is None: continue
         frac  = _K14_FRACTIONS[int(frac_idx)]
         ships = max(1, int(src.ships * frac))
         ships = min(ships, src.ships - _K14_MIN_KEEP)
-        if ships < _K14_MIN_SHIPS:
-            continue
+        if ships < _K14_MIN_SHIPS: continue
         aim = aim_with_prediction(src, tgt, ships, initial_by_id, ang_vel,
                                   comets=comets, comet_ids=comet_ids)
-        if aim is None:
-            continue
+        if aim is None: continue
         angle = aim[0] if isinstance(aim, tuple) else aim
         actions.append([int(src.id), float(angle), int(ships)])
     return actions
@@ -168,7 +212,7 @@ OLD_AGENT_IMPL_CORE = """    logits_np_b, _v = _NP_FORWARD(
 
     action_list = materialize_joint_action(picks, world, my_player)"""
 
-NEW_AGENT_IMPL_CORE = """    mode_logits_b, frac_logits_all_b = _NP_FORWARD(
+NEW_AGENT_IMPL_CORE = """    mode_logits_b, frac_logits_all_b, fused_p_b = _NP_FORWARD(
         pl[np.newaxis],
         pmask[np.newaxis],
         fl[np.newaxis],
@@ -178,8 +222,14 @@ NEW_AGENT_IMPL_CORE = """    mode_logits_b, frac_logits_all_b = _NP_FORWARD(
     )
     mode_logits_np     = mode_logits_b[0]       # (P, 5)
     frac_logits_all_np = frac_logits_all_b[0]   # (P, 5, 8)
+    fused_p_np         = fused_p_b[0]           # (P, d_entity)
 
-    picks = []  # (pid, mode_idx, frac_idx)
+    _W_tgt  = W['target_head.weight']   # (1, d_entity + CAND_FEAT_DIM)
+    _b_tgt  = W['target_head.bias']     # (1,)
+
+    raw_fleets = obs.get("fleets", []) or []
+    picks = []  # (pid, mode_idx, frac_idx, target_pid)
+    committed = {}  # coordination: target_pid -> ships already dispatched
     planet_by_id = {p.id: p for p in world.planets}
     for i, pid in enumerate(feat.get("planet_ids", [])):
         src = planet_by_id.get(int(pid))
@@ -194,10 +244,25 @@ NEW_AGENT_IMPL_CORE = """    mode_logits_b, frac_logits_all_b = _NP_FORWARD(
         mode_idx = int(np.random.choice(5, p=m_p))
         if mode_idx == 0:
             continue
-        fl = frac_logits_all_np[i, mode_idx].copy()
-        f_p = np.exp(fl - fl.max()); f_p = f_p / f_p.sum()
+        cands, cand_feats, n_valid = _k14_get_top_k(
+            src, world, my_player, mode_idx,
+            fleets_raw=raw_fleets, committed=committed,
+        )
+        if n_valid == 0:
+            continue
+        src_tok = fused_p_np[i]                          # (d,)
+        src_exp = np.tile(src_tok, (n_valid, 1))         # (n_valid, d)
+        inp     = np.concatenate([src_exp, cand_feats[:n_valid]], axis=1)  # (n_valid, d+CAND_FEAT_DIM)
+        t_scores = (_mm(inp, _W_tgt.T, _b_tgt)).squeeze(-1)               # (n_valid,)
+        t_p = np.exp(t_scores - t_scores.max()); t_p = t_p / t_p.sum()
+        tgt_idx = int(np.random.choice(n_valid, p=t_p))
+        target_pid = cands[tgt_idx].id
+        fl2 = frac_logits_all_np[i, mode_idx].copy()
+        f_p = np.exp(fl2 - fl2.max()); f_p = f_p / f_p.sum()
         frac_idx = int(np.random.choice(8, p=f_p))
-        picks.append((int(pid), mode_idx, frac_idx))
+        fracs = [0.05, 0.15, 0.30, 0.50, 0.65, 0.80, 0.95, 1.00]
+        committed[target_pid] = committed.get(target_pid, 0) + max(1, int(src.ships * fracs[frac_idx]))
+        picks.append((int(pid), mode_idx, frac_idx, target_pid))
 
     action_list = _k14_materialize(picks, world, my_player)"""
 
