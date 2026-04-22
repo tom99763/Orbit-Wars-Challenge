@@ -24,7 +24,7 @@ Observation format (per env, via get_obs_dict): Kaggle-compatible —
 This keeps drop-in compatibility with featurize_step / build_world.
 
 Limitations (kept simple for training):
-  - 2-player only (4-player to come)
+  - 2 / 3 / 4 player supported (P-fold rotational symmetry)
   - No comets (comets=[] always — agents never see comet rewards)
   - Random planet layouts per reset (not Kaggle's exact generator)
 """
@@ -86,80 +86,110 @@ def _segment_hits_sun_vec(x1, y1, x2, y2, safety: float = SUN_SAFETY) -> np.ndar
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Planet layout generation (2-player symmetric)
+# Planet layout generation (P-player rotationally symmetric)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_2p_layout(rng: np.random.Generator,
-                    n_inner: int = 8,
-                    n_outer: int = 6) -> dict:
-    """Generate one 2-player symmetric planet layout.
+def _make_layout(rng: np.random.Generator,
+                 n_players: int,
+                 n_inner_groups: int = 4,
+                 n_outer_groups: int = 3) -> dict:
+    """Generate one P-player symmetric planet layout (P ∈ {2, 3, 4}).
 
-    Returns arrays of shape [NP] where NP = 2 + n_inner + n_outer.
-    Index 0 = player 0 home; index 1 = player 1 home.
-    Remaining planets are arranged in mirror-pairs across the sun.
+    Total planets: NP = P × (1 + n_inner_groups + n_outer_groups)
+      index 0..P-1:                           P home planets, one per player
+      index P..P+n_inner_groups·P-1:          n_inner_groups orbiting groups
+      index P+n_inner_groups·P..NP-1:         n_outer_groups static groups
+
+    Each "group" is P planets placed at angles a, a+2π/P, ..., a+2π(P-1)/P
+    around the sun → P-fold rotational symmetry for fairness.
     """
-    NP = 2 + n_inner + n_outer
+    assert n_players in (2, 3, 4), f"n_players must be 2/3/4, got {n_players}"
+    P   = int(n_players)
+    NP  = P * (1 + n_inner_groups + n_outer_groups)
+    da  = 2.0 * math.pi / P     # angle between symmetric partners
+
     x   = np.zeros(NP, dtype=np.float32)
     y   = np.zeros(NP, dtype=np.float32)
     r   = np.zeros(NP, dtype=np.float32)
-    pd  = np.zeros(NP, dtype=np.float32)  # production
+    pd  = np.zeros(NP, dtype=np.float32)
     ow  = np.full(NP, -1, dtype=np.int8)
     sh  = np.zeros(NP, dtype=np.float32)
-    stc = np.zeros(NP, dtype=bool)        # is_static
-    orb = np.zeros(NP, dtype=np.float32)  # orbit radius
-    ang = np.zeros(NP, dtype=np.float32)  # init angle
+    stc = np.zeros(NP, dtype=bool)
+    orb = np.zeros(NP, dtype=np.float32)
+    ang = np.zeros(NP, dtype=np.float32)
 
-    def _add(i, cx, cy, ctheta, r_c, p):
-        pd[i]  = p
-        r[i]   = 1.0 + math.log(max(p, 1))
-        x[i]   = cx
-        y[i]   = cy
-        orb[i] = r_c
-        ang[i] = ctheta
-        stc[i] = (r_c + r[i] >= ROTATION_LIMIT)
+    def _add(i, rr, theta, p_val):
+        pd[i]  = p_val
+        r[i]   = 1.0 + math.log(max(p_val, 1))
+        x[i]   = CENTER_X + rr * math.cos(theta)
+        y[i]   = CENTER_Y + rr * math.sin(theta)
+        orb[i] = rr
+        ang[i] = theta
+        stc[i] = (rr + r[i] >= ROTATION_LIMIT)
 
-    # 1. Home planets: a mirror pair, mid-ring, production 3
+    def _angle_clash(aa, taken, tol):
+        for ta in taken:
+            d = ((aa - ta + math.pi) % (2 * math.pi)) - math.pi
+            if abs(d) < tol:
+                return True
+        return False
+
+    # 1. Home planets (production 3, 10 starting ships, owned by player)
     h_r = rng.uniform(18.0, 26.0)
     h_a = rng.uniform(0.0, 2 * math.pi)
-    for i, theta in enumerate([h_a, h_a + math.pi]):
-        _add(i, CENTER_X + h_r * math.cos(theta), CENTER_Y + h_r * math.sin(theta),
-             theta, h_r, 3)
-        ow[i] = i
-        sh[i] = 10.0
+    for p in range(P):
+        theta = h_a + p * da
+        _add(p, h_r, theta, 3)
+        ow[p] = p
+        sh[p] = 10.0
+    taken = [h_a + p * da for p in range(P)]
 
-    taken = [h_a, h_a + math.pi]
-
-    # 2. Inner orbiting mirror pairs
-    idx = 2
-    attempts = 0
-    while idx < 2 + n_inner and attempts < 200:
-        attempts += 1
+    # 2. Inner orbiting groups
+    idx = P
+    made, tries = 0, 0
+    while made < n_inner_groups and tries < 500:
+        tries += 1
         rr = rng.uniform(10.0, 38.0)
-        aa = rng.uniform(0.0, math.pi)
-        # avoid collisions in angle
-        if any(abs(((aa - ta + math.pi) % (2 * math.pi)) - math.pi) < 0.35 for ta in taken):
+        aa = rng.uniform(0.0, da)   # sample within one sector; symmetry fills rest
+        if _angle_clash(aa, taken, tol=0.35):
             continue
-        taken.append(aa); taken.append(aa + math.pi)
-        p_val = int(rng.choice([2, 3, 3, 4]))
-        for theta in [aa, aa + math.pi]:
-            if idx >= 2 + n_inner: break
-            _add(idx, CENTER_X + rr * math.cos(theta), CENTER_Y + rr * math.sin(theta),
-                 theta, rr, p_val)
-            sh[idx] = float(rng.integers(5, 40))
+        for p in range(P):
+            taken.append(aa + p * da)
+        p_val    = int(rng.choice([2, 3, 3, 4]))
+        ship_val = int(rng.integers(5, 40))
+        for p in range(P):
+            _add(idx, rr, aa + p * da, p_val)
+            sh[idx] = float(ship_val)
             idx += 1
+        made += 1
 
-    # 3. Outer static mirror pairs (near the edge)
-    attempts = 0
-    while idx < NP and attempts < 200:
-        attempts += 1
+    # 3. Outer static groups (near the edge, far from center)
+    made, tries = 0, 0
+    while made < n_outer_groups and tries < 500:
+        tries += 1
         rr = rng.uniform(41.0, 47.0)
-        aa = rng.uniform(0.0, math.pi)
-        p_val = int(rng.choice([1, 2, 3, 4, 5]))
-        for theta in [aa, aa + math.pi]:
-            if idx >= NP: break
-            _add(idx, CENTER_X + rr * math.cos(theta), CENTER_Y + rr * math.sin(theta),
-                 theta, rr, p_val)
-            sh[idx] = float(rng.integers(20, 90))
+        aa = rng.uniform(0.0, da)
+        if _angle_clash(aa, taken, tol=0.20):
+            continue
+        for p in range(P):
+            taken.append(aa + p * da)
+        p_val    = int(rng.choice([1, 2, 3, 4, 5]))
+        ship_val = int(rng.integers(20, 90))
+        for p in range(P):
+            _add(idx, rr, aa + p * da, p_val)
+            sh[idx] = float(ship_val)
+            idx += 1
+        made += 1
+
+    # Filler (rare — only when placement kept clashing)
+    while idx < NP:
+        rr = 46.0
+        aa = rng.uniform(0.0, da)
+        for p in range(P):
+            if idx >= NP:
+                break
+            _add(idx, rr, aa + p * da, 1)
+            sh[idx] = 30.0
             idx += 1
 
     return {
@@ -179,16 +209,16 @@ class OrbitWarsVecEnv:
     def __init__(self,
                  n_envs: int = 64,
                  n_players: int = 2,
-                 n_inner: int = 8,
-                 n_outer: int = 6,
+                 n_inner_groups: int = 4,
+                 n_outer_groups: int = 3,
                  ang_vel: float = 0.02,
                  seed: int = 42):
-        assert n_players == 2, "only 2P supported for now"
+        assert n_players in (2, 3, 4), f"n_players must be 2/3/4, got {n_players}"
         self.N  = int(n_envs)
         self.P  = int(n_players)
-        self.NP = 2 + int(n_inner) + int(n_outer)
-        self.n_inner = n_inner
-        self.n_outer = n_outer
+        self.NP = self.P * (1 + int(n_inner_groups) + int(n_outer_groups))
+        self.n_inner_groups = int(n_inner_groups)
+        self.n_outer_groups = int(n_outer_groups)
         self.ang_vel = float(ang_vel)
         self.rng = np.random.default_rng(int(seed))
 
@@ -232,7 +262,10 @@ class OrbitWarsVecEnv:
         ids = (np.arange(self.N) if env_ids is None
                else np.asarray(env_ids, dtype=np.int64))
         for eid in ids:
-            layout = _make_2p_layout(self.rng, self.n_inner, self.n_outer)
+            layout = _make_layout(
+                self.rng, self.P,
+                self.n_inner_groups, self.n_outer_groups,
+            )
             self.pl_init_x[eid]     = layout["x"]
             self.pl_init_y[eid]     = layout["y"]
             self.pl_radius[eid]     = layout["radius"]
@@ -525,30 +558,27 @@ if __name__ == "__main__":
         return [[int(src[0]), float(ang), ships]]
 
     N = 64
-    env = OrbitWarsVecEnv(n_envs=N, n_players=2, seed=0)
-    print(f"N_ENVS={N}  NP={env.NP}  MAX_FLEETS={MAX_FLEETS}")
+    for P in (2, 3, 4):
+        env = OrbitWarsVecEnv(n_envs=N, n_players=P, seed=P * 101)
+        print(f"\n── {P}P  NP={env.NP}  MAX_FLEETS={MAX_FLEETS} ───────────────")
 
-    # Run 500 steps, measure speed
-    t0 = time.time()
-    total_steps = 0
-    while not env.done_mask.all() and env.step_num.max() < TOTAL_STEPS:
-        # Build per-env actions from random policy
-        obs_all = [env.get_obs_dict(eid) for eid in range(N)]
-        actions = [
-            {0: random_policy(o, 0), 1: random_policy(o, 1)}
-            for o in obs_all
-        ]
-        obs_list, rewards, dones = env.step(actions)
-        total_steps += 1
-        if total_steps == 1:
-            print(f"After step 1: fleets active (env 0) = "
-                  f"{int(env.fl_active[0].sum())}")
-        if total_steps % 100 == 0:
-            print(f"  step {total_steps}  done={int(dones.sum())}/{N}  "
-                  f"fleets_avg={float(env.fl_active.sum()) / N:.1f}")
+        t0 = time.time()
+        total_steps = 0
+        while not env.done_mask.all() and env.step_num.max() < TOTAL_STEPS:
+            obs_all = [env.get_obs_dict(eid) for eid in range(N)]
+            actions = [
+                {p: random_policy(o, p) for p in range(P)}
+                for o in obs_all
+            ]
+            obs_list, rewards, dones = env.step(actions)
+            total_steps += 1
 
-    dt = time.time() - t0
-    print(f"\n500-step sweep over {N} envs: {dt:.2f}s  "
-          f"({N * total_steps / dt:.0f} env-steps/s)")
-    print(f"winners: {dict(zip(*np.unique(env.winner, return_counts=True)))}")
-    print(f"avg game length: {float(env.step_num.mean()):.1f} steps")
+        dt = time.time() - t0
+        env_steps_per_s = N * total_steps / dt if dt > 0 else 0
+        winners = dict(zip(*np.unique(env.winner, return_counts=True)))
+        # draws show as -1
+        win_counts = {int(k): int(v) for k, v in winners.items()}
+        print(f"  time: {dt:.2f}s  env-steps/s: {env_steps_per_s:.0f}  "
+              f"games/s: {N / dt:.1f}")
+        print(f"  winners (seat→wins): {win_counts}")
+        print(f"  avg game length: {float(env.step_num.mean()):.0f} steps")
