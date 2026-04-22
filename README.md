@@ -1,4 +1,142 @@
-# Orbit Wars
+# Orbit Wars Challenge — tom99763's RL Pipeline
+
+This repo is my entry for the Kaggle [Orbit Wars](https://www.kaggle.com/competitions/orbit-wars)
+Featured Simulation Competition. It bundles a full RL training pipeline on top
+of a vectorized game simulator, plus the Kaggle submission build scripts.
+
+The rest of this README (starting at [Game Rules](#game-rules) below) is the
+official game documentation downloaded from Kaggle, kept for reference.
+
+---
+
+## Project at a glance
+
+```
+Stage 1  (imitation)   Scrape top-10 replays hourly  →  BC on winning trajectories
+Stage 2  (online RL)   PPO warm-started from BC      →  k12/k13 (candidate picker)
+Stage 3  (k14 factored) Mode × Target × Frac actions →  self-play + opponent pool
+Stage 4  (k14-vec)     NumPy-batched vec env         →  8-worker IPPO, this branch
+```
+
+### Agent architecture (k14)
+
+```
+Obs → [SetAttention entity encoder] ──┐
+       (planets + fleets + globals)   │
+Obs → [Spatial CNN on rasterized map] ┼→ fused_global
+Obs → [Scalar MLP on globals]         ┘
+
+Per-owned-planet:
+  mode_head   (5)  — pass / expand / attack / reinforce / denial
+  target_head (K=4 candidates × 10 features — fleet-race aware)
+  frac_head   (8) — 5 % / 15 % / 30 % / 50 % / 65 % / 80 % / 95 % / 100 %
+value_head  (1)  — PBRS V(s) for GAE
+
+Reward: PBRS  φ(s) = prod_share + 0.5·ship_share − 0.3·enemy_ship_share
+```
+
+### Repository layout
+
+```
+main.py                               Kaggle submission entry point (agent(obs))
+training/
+  orbit_wars_vec_env.py               Vectorized numpy simulator (N_ENVS parallel, 2P/3P/4P)
+  orbit_wars_policy.py                rollout_step + eval_batch (identical log_prob formula)
+  physics_picker_k14_vec.py           Current trainer — 8 workers × vec env
+  physics_picker_k14_torchrl.py       Earlier TorchRL-based trainer (pre-vec-env)
+  physics_picker_k14_selfplay.py      Original k14 self-play (pre-torchrl)
+  physics_picker_k13_ppo.py           DualStreamK13Agent model definition
+  physics_action_helper_k13.py        Mode × Target × Frac decoder, fleet-race features
+  dual_stream_model.py                SpatialCNN + ScalarMLP + SetAttentionBlock
+  lb1200_agent.py / lb928_agent.py    Scripted eval opponents
+  build_k14_submission.py             .pt → numpy submission (base64-embedded weights)
+  convert_weights_to_npz.py           Weight converter
+  checkpoints/                        Saved model states (not in git)
+
+notebooks/
+  orbit_wars_k14.py                   Generated numpy submission
+  orbit_wars_v3_numpy.py              Template for build_k14_submission.py
+  weight/                             Weight bundles staged for Kaggle notebooks
+
+featurize.py                          Shared feature extraction (planets, fleets, history)
+pipeline.py                           Scrape + parse replays pipeline
+scrape_top5.py / parse_replays.py     Leaderboard scraper + trajectory parser
+```
+
+### Key design decisions (= hard-learned lessons)
+
+- **Only numpy ships to Kaggle.** The grader sandbox kills C-extension ML
+  runtimes (torch, JAX). Weights are base64-embedded `.npz`; `main.py` does
+  all inference via numpy matmul.
+- **Submission hygiene.** Exactly one public `agent` function, no
+  `agent_debug` / `agent_*` siblings — the grader picks the first public
+  `agent*` it sees alphabetically.
+- **Factored action space.** `K=12` monolithic candidate head (k12) collapsed
+  to few strategies; splitting into `mode × target × frac` (k14) breaks the
+  collapse and exposes physics-aware target features (ETA, race-margin,
+  projected garrison).
+- **PBRS, not shaped reward.** Potential-based shaping on production/ship
+  share has zero policy-gradient bias. Terminal ±1 is the only non-PBRS term.
+- **Vectorized env.** `OrbitWarsVecEnv` runs N games in parallel numpy with
+  faithful combat (largest − 2nd largest), sun-crossing death, orbital
+  mechanics, and comets. Measured ~8000–9000 env-steps/s at N=64 — ~300 ×
+  faster than `kaggle_environments` per step.
+
+### Training
+
+```bash
+# The current run (k14-vec, 8 workers × 8 envs, 64 games/iter):
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=0 \
+python training/physics_picker_k14_vec.py \
+    --warm-start training/checkpoints/physics_picker_k14_vec.pt \
+    --workers 8 --n-envs-per-worker 8 \
+    --target-iters 200000 \
+    --ppo-epochs 4 --mini-batch 256 \
+    --eval-every 10 --eval-games 8 \
+    --lb-prob 0.1 --four-player-prob 0 \
+    --out training/checkpoints/physics_picker_k14_vec.pt
+```
+
+### Submitting
+
+```bash
+# 1. Convert the latest checkpoint to numpy
+python training/convert_weights_to_npz.py \
+    training/checkpoints/physics_picker_k14_vec_iter00580.pt \
+    training/physics_picker_k14_weights.npz
+
+# 2. Build the submission (base64-embeds the .npz into orbit_wars_k14.py)
+python training/build_k14_submission.py
+
+# 3. (Safety) AST-check: exactly one public `agent`, no agent_* siblings
+python -c "import ast; \
+  tree = ast.parse(open('notebooks/orbit_wars_k14.py').read()); \
+  funcs = [n.name for n in ast.walk(tree) \
+           if isinstance(n, ast.FunctionDef) and not n.name.startswith('_')]; \
+  agents = [f for f in funcs if f == 'agent' or f.startswith('agent_')]; \
+  assert agents == ['agent'], agents"
+
+# 4. Submit (daily quota ~5 — ERRORs don't count)
+kaggle competitions submit orbit-wars \
+    -f notebooks/orbit_wars_k14.py \
+    -m "k14_vec ..."
+```
+
+### Scraper pipeline (imitation data)
+
+```bash
+python3 pipeline.py                        # one-shot
+./install_cron.sh --every 30 --days 7      # every 30 min for 7 days
+tail -f .cron.log                          # watch
+```
+
+See [CLAUDE.md](CLAUDE.md) for repository conventions (notebook layout,
+per-day sim folders, Playwright `LD_LIBRARY_PATH` setup, trajectory dedup).
+
+---
+
+# Game Rules
 
 Conquer planets rotating around a sun in continuous 2D space. A real-time strategy game for 2 or 4 players.
 

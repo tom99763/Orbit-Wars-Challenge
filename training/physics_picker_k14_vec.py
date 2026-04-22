@@ -346,10 +346,16 @@ class OpponentPool:
         return random.randrange(n)
 
 
+def _current_noise(iter_, lb_start, noise_end, noise_start) -> float:
+    """Same schedule as _opp_task — exposed for logging."""
+    if iter_ < lb_start:
+        return 1.0
+    return max(0.0, noise_start * (1.0 - (iter_ - lb_start) / max(1, noise_end - lb_start)))
+
+
 def _opp_task(pool, iter_, lb_prob, lb_start, noise_end, noise_start):
     n = len(pool)
-    noise = max(0.0, noise_start * (1.0 - (iter_ - lb_start) / max(1, noise_end - lb_start))) \
-            if iter_ >= lb_start else 1.0
+    noise = _current_noise(iter_, lb_start, noise_end, noise_start)
     if n < 2:
         return {"opp_type": "stochastic_self" if random.random() < 0.5 else "noop"}
     r = random.random()
@@ -561,6 +567,8 @@ def main():
         opp_str = "  ".join(f"{k}={v[0]}/{v[1]}" for k, v in ow.items() if v[1])
         mc_str  = " ".join(str(c) for c in mc)
         fc_str  = " ".join(str(c) for c in fc)
+        noise_now = _current_noise(iter_, args.lb_start_iter,
+                                   args.noise_end_iter, args.noise_start_prob)
         print(
             f"[iter {iter_:05d}]  "
             f"wins={wins}/{tg}  ({opp_str})  "
@@ -569,6 +577,7 @@ def main():
             f"ent={info.get('ent',0):.3f}  "
             f"r={info.get('ratio_mean',1):.2f}/{info.get('ratio_max',1):.1f}  "
             f"ent_c={ent_c:.3f}  pool={len(pool)}  "
+            f"lb_noise={noise_now:.2f}  "
             f"mc=[{mc_str}]  fc=[{fc_str}]  [{elapsed:.0f}s]",
             flush=True,
         )
@@ -608,7 +617,8 @@ def main():
                     if r["wins"].get(eid, -1) == ps:
                         ew[opp_name][0] += 1
             parts = [f"{k}={w}/{g}" for k, (w, g) in sorted(ew.items())]
-            print(f"[iter {iter_:05d}] EVAL  {' '.join(parts)}", flush=True)
+            print(f"[iter {iter_:05d}] EVAL  {' '.join(parts)}  "
+                  f"(eval uses clean lb agents, noise=0.00)", flush=True)
 
     wp.close(); wp.join()
     torch.save({"model": net.state_dict(),
