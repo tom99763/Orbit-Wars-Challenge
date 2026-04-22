@@ -25,7 +25,9 @@ This keeps drop-in compatibility with featurize_step / build_world.
 
 Limitations (kept simple for training):
   - 2 / 3 / 4 player supported (P-fold rotational symmetry)
-  - No comets (comets=[] always — agents never see comet rewards)
+  - Comets modelled: 4 per spawn event at steps 50/150/250/350/450,
+    straight-line trajectories, auto-captured on fleet intersection
+    (approximation — real Kaggle uses elliptical orbits)
   - Random planet layouts per reset (not Kaggle's exact generator)
 """
 from __future__ import annotations
@@ -48,6 +50,15 @@ TOTAL_STEPS     = 500
 LAUNCH_CLEAR    = 0.1
 
 MAX_FLEETS      = 200    # per env (fixed-size fleet array)
+
+# Comets
+COMET_SPAWN_STEPS = (50, 150, 250, 350, 450)
+COMET_PER_EVENT   = 4
+MAX_COMETS        = 20        # 4 × 5 spawn events
+COMET_SPEED       = 2.5       # units / turn
+COMET_TTL         = 80        # turns after spawn before despawn
+COMET_RADIUS      = 1.0       # collision radius for fleet capture
+COMET_SHIPS_RANGE = (5, 30)   # random ship bonus per comet
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,7 +167,8 @@ def _make_layout(rng: np.random.Generator,
         for p in range(P):
             taken.append(aa + p * da)
         p_val    = int(rng.choice([2, 3, 3, 4]))
-        ship_val = int(rng.integers(5, 40))
+        # Skewed-low ship distribution matching Kaggle (5-99, median ~15)
+        ship_val = int(np.clip(rng.exponential(15.0) + 5.0, 5, 99))
         for p in range(P):
             _add(idx, rr, aa + p * da, p_val)
             sh[idx] = float(ship_val)
@@ -211,7 +223,7 @@ class OrbitWarsVecEnv:
                  n_players: int = 2,
                  n_inner_groups: int = 4,
                  n_outer_groups: int = 3,
-                 ang_vel: float = 0.02,
+                 ang_vel_range: tuple = (0.005, 0.03),
                  seed: int = 42):
         assert n_players in (2, 3, 4), f"n_players must be 2/3/4, got {n_players}"
         self.N  = int(n_envs)
@@ -219,7 +231,7 @@ class OrbitWarsVecEnv:
         self.NP = self.P * (1 + int(n_inner_groups) + int(n_outer_groups))
         self.n_inner_groups = int(n_inner_groups)
         self.n_outer_groups = int(n_outer_groups)
-        self.ang_vel = float(ang_vel)
+        self.ang_vel_range = tuple(ang_vel_range)
         self.rng = np.random.default_rng(int(seed))
 
         N, NP = self.N, self.NP
@@ -250,10 +262,20 @@ class OrbitWarsVecEnv:
         self.fl_angle  = np.zeros((N, MAX_FLEETS), dtype=np.float32)
         self.fl_active = np.zeros((N, MAX_FLEETS), dtype=bool)
 
+        # Comet state
+        self.c_active = np.zeros((N, MAX_COMETS), dtype=bool)
+        self.c_x      = np.zeros((N, MAX_COMETS), dtype=np.float32)
+        self.c_y      = np.zeros((N, MAX_COMETS), dtype=np.float32)
+        self.c_vx     = np.zeros((N, MAX_COMETS), dtype=np.float32)
+        self.c_vy     = np.zeros((N, MAX_COMETS), dtype=np.float32)
+        self.c_ships  = np.zeros((N, MAX_COMETS), dtype=np.float32)
+        self.c_ttl    = np.zeros((N, MAX_COMETS), dtype=np.int16)
+
         # Meta
         self.step_num  = np.zeros(N, dtype=np.int32)
         self.done_mask = np.zeros(N, dtype=bool)
         self.winner    = np.full(N, -1, dtype=np.int8)
+        self.ang_vel   = np.full(N, 0.02, dtype=np.float32)  # per-env, randomized on reset
 
         self.reset()
 
@@ -282,17 +304,22 @@ class OrbitWarsVecEnv:
             self.fl_owner[eid]  = -1
             self.fl_ships[eid]  = 0.0
 
+            self.c_active[eid]  = False
+            self.c_ships[eid]   = 0.0
+            self.c_ttl[eid]     = 0
+
             self.step_num[eid]  = 0
             self.done_mask[eid] = False
             self.winner[eid]    = -1
+            self.ang_vel[eid]   = float(self.rng.uniform(*self.ang_vel_range))
 
         return [self.get_obs_dict(int(eid)) for eid in ids]
 
     # ─── planet orbital update ────────────────────────────────────────────────
     def _update_planet_positions(self):
         """Vectorized: pl_x, pl_y ← orbital position at current step."""
-        # current angle = init_angle + ang_vel * step
-        new_a = self.pl_init_angle + self.ang_vel * self.step_num[:, None]
+        # ang_vel is per-env: shape [N], broadcast to [N, 1]
+        new_a = self.pl_init_angle + self.ang_vel[:, None] * self.step_num[:, None]
         new_x = CENTER_X + self.pl_orbit_r * np.cos(new_a)
         new_y = CENTER_Y + self.pl_orbit_r * np.sin(new_a)
         self.pl_x = np.where(self.pl_is_static, self.pl_init_x, new_x).astype(np.float32)
@@ -480,6 +507,79 @@ class OrbitWarsVecEnv:
             return -1  # draw
         return best
 
+    # ─── comets ───────────────────────────────────────────────────────────────
+    def _spawn_comets(self):
+        """Spawn COMET_PER_EVENT comets per env at trigger steps."""
+        for eid in range(self.N):
+            if self.done_mask[eid]:
+                continue
+            if int(self.step_num[eid]) not in COMET_SPAWN_STEPS:
+                continue
+            free = np.where(~self.c_active[eid])[0]
+            for i in range(min(COMET_PER_EVENT, len(free))):
+                slot = int(free[i])
+                # Spawn on random edge, aim across board with arc-ish velocity
+                edge = int(self.rng.integers(0, 4))
+                perp = float(self.rng.uniform(-1.5, 1.5))
+                if edge == 0:    # left edge, moving right
+                    x, y = 1.0, float(self.rng.uniform(15, 85))
+                    vx, vy = COMET_SPEED,  perp
+                elif edge == 1:  # top, moving down
+                    x, y = float(self.rng.uniform(15, 85)), 1.0
+                    vx, vy = perp, COMET_SPEED
+                elif edge == 2:  # right, moving left
+                    x, y = 99.0, float(self.rng.uniform(15, 85))
+                    vx, vy = -COMET_SPEED, perp
+                else:            # bottom, moving up
+                    x, y = float(self.rng.uniform(15, 85)), 99.0
+                    vx, vy = perp, -COMET_SPEED
+                self.c_active[eid, slot] = True
+                self.c_x[eid, slot]      = x
+                self.c_y[eid, slot]      = y
+                self.c_vx[eid, slot]     = vx
+                self.c_vy[eid, slot]     = vy
+                self.c_ships[eid, slot]  = float(self.rng.integers(*COMET_SHIPS_RANGE))
+                self.c_ttl[eid, slot]    = COMET_TTL
+
+    def _move_comets(self):
+        """Vectorized comet move + despawn (sun / out-of-bounds / TTL)."""
+        active_f = self.c_active.astype(np.float32)
+        self.c_x += self.c_vx * active_f
+        self.c_y += self.c_vy * active_f
+        # decrement TTL on active comets only
+        self.c_ttl = np.where(self.c_active, self.c_ttl - 1, self.c_ttl)
+
+        d2     = (self.c_x - CENTER_X) ** 2 + (self.c_y - CENTER_Y) ** 2
+        hit_s  = (d2 < SUN_R * SUN_R) & self.c_active
+        oob    = ((self.c_x < 0) | (self.c_x > BOARD) |
+                  (self.c_y < 0) | (self.c_y > BOARD)) & self.c_active
+        exp    = (self.c_ttl <= 0) & self.c_active
+        dead   = hit_s | oob | exp
+        if dead.any():
+            self.c_active &= ~dead
+            self.c_ships   = np.where(dead, 0.0, self.c_ships)
+
+    def _resolve_comet_captures(self):
+        """Fleet within COMET_RADIUS of a comet absorbs its ships; comet dies."""
+        for c in range(MAX_COMETS):
+            active_env = self.c_active[:, c]
+            if not active_env.any():
+                continue
+            cx = self.c_x[:, c:c+1]    # [N, 1]
+            cy = self.c_y[:, c:c+1]
+            cs = self.c_ships[:, c]    # [N]
+            d2 = (self.fl_x - cx) ** 2 + (self.fl_y - cy) ** 2
+            hit = (d2 < COMET_RADIUS * COMET_RADIUS) & self.fl_active & active_env[:, None]
+            if not hit.any():
+                continue
+            # For each env with a hit: the first intersecting fleet grabs it
+            hit_envs = np.where(hit.any(axis=1))[0]
+            for eid in hit_envs:
+                first = int(np.argmax(hit[eid]))
+                self.fl_ships[eid, first] += float(cs[eid])
+                self.c_active[eid, c] = False
+                self.c_ships[eid, c]  = 0.0
+
     # ─── public step ──────────────────────────────────────────────────────────
     def step(self, actions: list) -> tuple:
         """Advance all N envs by one step.
@@ -491,6 +591,11 @@ class OrbitWarsVecEnv:
         self.step_num += (~self.done_mask).astype(np.int32)
         self._update_planet_positions()
         self._resolve_arrivals()
+
+        self._spawn_comets()
+        self._move_comets()
+        self._resolve_comet_captures()
+
         self._produce()
         rewards = self._check_done()
         obs_list = [self.get_obs_dict(eid) for eid in range(self.N)]
@@ -526,13 +631,23 @@ class OrbitWarsVecEnv:
                 0.0,
                 float(self.pl_prod[eid, p]),
             ])
+        comets = []
+        active_c = np.where(self.c_active[eid])[0]
+        for c in active_c:
+            c = int(c)
+            comets.append([
+                c,
+                float(self.c_x[eid, c]),  float(self.c_y[eid, c]),
+                float(self.c_vx[eid, c]), float(self.c_vy[eid, c]),
+                float(self.c_ships[eid, c]),
+            ])
         return {
             "step":             int(self.step_num[eid]),
             "planets":          planets,
             "fleets":           fleets,
-            "angular_velocity": float(self.ang_vel),
+            "angular_velocity": float(self.ang_vel[eid]),
             "initial_planets":  initial_planets,
-            "comets":           [],
+            "comets":           comets,
             "n_players":        self.P,
         }
 
