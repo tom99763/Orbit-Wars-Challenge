@@ -223,7 +223,17 @@ def _vec_rollout_worker(task: dict) -> dict:
                                     from training.lb928_agent import agent as _a
                                 else:
                                     from training.lb1200_agent import agent as _a
-                                action_list = _a(obs) or []
+                                # vec_env's obs lacks `player` and `comet_planet_ids`;
+                                # without `player` lb defaults to seat 0 and either
+                                # crashes (wrong planet ownership) or no-ops, masking
+                                # the real opponent. Patch the obs per-seat each call.
+                                lb_obs = {
+                                    **obs,
+                                    "player": seat,
+                                    "comet_planet_ids": obs.get("comet_planet_ids", []),
+                                    "remainingOverageTime": obs.get("remainingOverageTime", 60.0),
+                                }
+                                action_list = _a(lb_obs) or []
                             except Exception:
                                 action_list = []
                     else:
@@ -314,6 +324,7 @@ def _vec_rollout_worker(task: dict) -> dict:
         "pick_seats":   pick_seats,
         "wins":         wins,
         "opp":          opp_type,
+        "pool_idx":     task.get("pool_idx", -1),
         "mode_counts":  mode_counts,
         "frac_counts":  frac_counts,
         "n_envs":       n_envs,
@@ -324,26 +335,75 @@ def _vec_rollout_worker(task: dict) -> dict:
 # Opponent pool
 # ──────────────────────────────────────────────────────────────────────────────
 class OpponentPool:
-    def __init__(self, max_size=20):
-        self.snapshots, self.tags = [], []
-        self.max_size = max_size
+    """League pool with PFSP sampling and adaptive eviction.
 
-    def add(self, sd_bytes, tag):
-        self.snapshots.append(sd_bytes); self.tags.append(tag)
+    Per-snapshot win-rate (EMA) drives two policies:
+      sampling — pick HARD opponents more often: w_i ∝ (1 − win_rate_i)^p + floor
+      eviction — drop the EASIEST mature snapshot when pool is full
+
+    `record_result(idx, won)` must be called for every game played against a
+    pool snapshot; idx is the value returned by the matching `sample_index()`.
+    Indices are stable within an iteration (no add() runs while rollouts are
+    in flight), so the round-trip task → result is safe.
+    """
+
+    def __init__(self, max_size: int = 20, pfsp_p: float = 2.0,
+                 pfsp_floor: float = 0.05, ema_alpha: float = 0.15):
+        self.snapshots: list[bytes] = []
+        self.tags:      list[str]   = []
+        self.win_ema:   list[float] = []   # EMA of P(we beat snapshot i), in [0, 1]
+        self.games:     list[int]   = []   # raw count for confidence / eviction grace
+        self.max_size  = max_size
+        self.pfsp_p    = pfsp_p
+        self.pfsp_floor = pfsp_floor
+        self.ema_alpha = ema_alpha
+
+    def add(self, sd_bytes: bytes, tag: str) -> None:
+        self.snapshots.append(sd_bytes)
+        self.tags.append(tag)
+        self.win_ema.append(0.5)        # neutral prior — sampled often until proven easy
+        self.games.append(0)
         if len(self.snapshots) > self.max_size:
-            drop = len(self.snapshots) // 2
-            self.snapshots.pop(drop); self.tags.pop(drop)
+            # Drop the snapshot we've beaten most (least informative training signal).
+            # Protect entries with < min_games games so fresh additions get a chance.
+            min_games = 3
+            mature = [i for i, g in enumerate(self.games) if g >= min_games]
+            drop = (max(mature, key=lambda i: self.win_ema[i])
+                    if mature else 0)   # FIFO fallback when nothing mature
+            for arr in (self.snapshots, self.tags, self.win_ema, self.games):
+                arr.pop(drop)
 
-    def __len__(self): return len(self.snapshots)
+    def __len__(self) -> int:
+        return len(self.snapshots)
 
     def sample_index(self) -> int:
-        n = len(self.snapshots); r = random.random()
-        if r < 0.5 and n >= 2:
-            return n - 1 - random.randrange(min(5, n))
-        if r < 0.8 and n >= 3:
-            lo = n // 3; hi = max(lo + 1, 2 * n // 3)
-            return random.randrange(lo, hi)
-        return random.randrange(n)
+        n = len(self.snapshots)
+        if n == 0:
+            return -1
+        if n == 1:
+            return 0
+        weights = [
+            (1.0 - min(0.99, self.win_ema[i])) ** self.pfsp_p + self.pfsp_floor
+            for i in range(n)
+        ]
+        return random.choices(range(n), weights=weights, k=1)[0]
+
+    def record_result(self, idx: int, won: bool) -> None:
+        if not (0 <= idx < len(self.snapshots)):
+            return
+        x = 1.0 if won else 0.0
+        self.win_ema[idx] = (1.0 - self.ema_alpha) * self.win_ema[idx] + self.ema_alpha * x
+        self.games[idx] += 1
+
+    def stats(self, top_k: int = 3) -> str:
+        """Short summary of the K hardest snapshots (lowest win-rate against them)."""
+        if not self.snapshots:
+            return ""
+        order = sorted(range(len(self.snapshots)), key=lambda i: self.win_ema[i])
+        return " ".join(
+            f"{self.tags[i]}={self.win_ema[i]:.2f}({self.games[i]})"
+            for i in order[:top_k]
+        )
 
 
 def _current_noise(iter_, lb_start, noise_end, noise_start) -> float:
@@ -367,7 +427,10 @@ def _opp_task(pool, iter_, lb_prob, lb_start, noise_end, noise_start):
         return {"opp_type": "noop"}
     if rr < 0.30:
         return {"opp_type": "stochastic_self"}
-    return {"opp_type": "pool", "opp_weights_bytes": pool.snapshots[pool.sample_index()]}
+    pool_idx = pool.sample_index()
+    return {"opp_type": "pool",
+            "opp_weights_bytes": pool.snapshots[pool_idx],
+            "pool_idx": pool_idx}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -488,6 +551,12 @@ def main():
     ap.add_argument("--val-coef",           type=float, default=0.5)
     ap.add_argument("--snapshot-every",     type=int, default=5)
     ap.add_argument("--pool-size",          type=int, default=20)
+    ap.add_argument("--pfsp-p",             type=float, default=2.0,
+                    help="PFSP exponent: w_i ∝ (1 - winrate_i)^p. Higher = harder bias.")
+    ap.add_argument("--pfsp-floor",         type=float, default=0.05,
+                    help="Min sampling weight per snapshot (prevents starvation).")
+    ap.add_argument("--pfsp-ema-alpha",     type=float, default=0.15,
+                    help="EMA mixing for win-rate updates (~ window of 1/alpha games).")
     ap.add_argument("--eval-every",         type=int, default=10)
     ap.add_argument("--eval-games",         type=int, default=20)
     ap.add_argument("--lb-prob",            type=float, default=0.2)
@@ -514,7 +583,10 @@ def main():
     init_head_biases(net)
 
     opt  = torch.optim.Adam(net.parameters(), lr=args.lr)
-    pool = OpponentPool(max_size=args.pool_size)
+    pool = OpponentPool(max_size=args.pool_size,
+                        pfsp_p=args.pfsp_p,
+                        pfsp_floor=args.pfsp_floor,
+                        ema_alpha=args.pfsp_ema_alpha)
 
     def sdb():
         buf = io.BytesIO()
@@ -554,6 +626,21 @@ def main():
 
         all_samples, wins, tg, ow, mc, fc = _flatten_rollouts(rollouts)
 
+        # PFSP bookkeeping: record win/loss against the sampled pool snapshot.
+        # Indices are stable here — pool.add() runs later in the iter, so
+        # pool_idx values returned by workers still point at the same entry.
+        for r in rollouts:
+            if r.get("opp") != "pool":
+                continue
+            pidx = r.get("pool_idx", -1)
+            if pidx < 0:
+                continue
+            for eid in range(r["n_envs"]):
+                w = r["wins"].get(eid, -1)
+                if w < 0:
+                    continue                       # game didn't finish in step budget
+                pool.record_result(pidx, w == r["pick_seats"][eid])
+
         alpha = min(1.0, (iter_ - args.start_iter) / max(1, args.ent_decay_iters))
         ent_c = args.ent_coef_start + alpha * (args.ent_coef_end - args.ent_coef_start)
         info = ppo_update(net, opt, all_samples, device,
@@ -569,6 +656,7 @@ def main():
         fc_str  = " ".join(str(c) for c in fc)
         noise_now = _current_noise(iter_, args.lb_start_iter,
                                    args.noise_end_iter, args.noise_start_prob)
+        pfsp_str = pool.stats(top_k=3)
         print(
             f"[iter {iter_:05d}]  "
             f"wins={wins}/{tg}  ({opp_str})  "
@@ -577,6 +665,7 @@ def main():
             f"ent={info.get('ent',0):.3f}  "
             f"r={info.get('ratio_mean',1):.2f}/{info.get('ratio_max',1):.1f}  "
             f"ent_c={ent_c:.3f}  pool={len(pool)}  "
+            f"hardest=[{pfsp_str}]  "
             f"lb_noise={noise_now:.2f}  "
             f"mc=[{mc_str}]  fc=[{fc_str}]  [{elapsed:.0f}s]",
             flush=True,
