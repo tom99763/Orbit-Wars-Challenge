@@ -27,6 +27,9 @@ training/checkpoints/
 .selfplay*
 .synth_gen*
 
+# Training + benchmark logs (run-local, not shared)
+training/logs/
+
 # Kaggle artefacts
 orbit-wars.zip
 orbit-wars-kit.tar.gz*
