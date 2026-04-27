@@ -23,15 +23,43 @@ state_dict — same architecture, just different trained weights.
 import pathlib
 import sys
 
-# Bundle root is this file's directory; insert FIRST so our `training/`
-# subdir wins over any same-named module that might be on the grader's
-# path. Without this, `from training.lb1200_agent import ...` fails.
-_HERE = pathlib.Path(__file__).resolve().parent
+
+def _bundle_root() -> pathlib.Path:
+    """Locate the bundle root robustly.
+
+    Kaggle Environments runs main.py via `exec(code, env)` which leaves
+    __file__ undefined, so direct `pathlib.Path(__file__)` raises
+    NameError on the grader (but works locally). Fall back to known
+    grader paths and CWD when __file__ isn't available.
+    """
+    try:
+        return pathlib.Path(__file__).resolve().parent
+    except NameError:
+        pass
+    for candidate in (
+        pathlib.Path("/kaggle_simulations/agent"),
+        pathlib.Path.cwd(),
+    ):
+        if (candidate / "model.pt").exists():
+            return candidate
+    raise RuntimeError(
+        "k14_lb1200_hybrid: cannot locate bundle root "
+        "(no model.pt at /kaggle_simulations/agent or cwd)"
+    )
+
+
+# Insert FIRST so our `training/` subdir wins over any same-named module
+# that might be on the grader's path. Without this,
+# `from training.lb1200_agent import ...` would fall through to a stale
+# package elsewhere on sys.path.
+_HERE = _bundle_root()
 sys.path.insert(0, str(_HERE))
 
 from training.hybrid_agent import load_hybrid_agent
 
 _CKPT = _HERE / "model.pt"
+if not _CKPT.exists():
+    raise FileNotFoundError(f"model.pt not found at {_CKPT}")
 _AGENT = load_hybrid_agent(
     str(_CKPT),
     strategy="lb1200_with_k14_veto",
