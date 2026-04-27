@@ -51,6 +51,15 @@ from training.physics_action_helper_k13 import (
 from training.physics_picker_k13_ppo import (
     DualStreamK13Agent, load_k12_into_k13, init_head_biases, GRID, GAMMA,
 )
+# Reward-shaping constants (audit add-ons)
+SUN_CENTER = 50.0
+SUN_DEATH_RADIUS = 15.0          # fleets disappearing within this radius are sun-killed
+COMET_SPAWN_STEPS = (50, 150, 250, 350, 450)
+COMET_WIN = {s + d for s in COMET_SPAWN_STEPS for d in range(-5, 6)}
+COMET_PROD_MULT = 1.5            # multiplier on prod_phi delta during comet windows
+SUN_PENALTY = 0.10               # weight on sun_lost / 100 term
+PBRS_CLIP = 1.0                  # |r_step| cap, mirrors offline shaper
+
 from training.orbit_wars_policy import (
     rollout_step, eval_batch, build_sample_td,
     MAX_PLANETS, MAX_FLEETS,
@@ -149,6 +158,7 @@ def _vec_rollout_worker(task: dict) -> dict:
         (eid, s): {"prod_phi": 0.0, "ship_phi": 0.0, "enemy_ship_phi": 0.0}
         for eid in range(n_envs) for s in range(n_players)
     }
+    prev_fleets = {eid: [] for eid in range(n_envs)}   # for sun-loss diff
 
     mode_counts = [0] * N_MODES
     frac_counts = [0] * N_FRACS
@@ -161,6 +171,8 @@ def _vec_rollout_worker(task: dict) -> dict:
                 actions_batch.append({})
                 continue
             obs = env.get_obs_dict(eid)
+            # Capture pre-step fleet state per eid for sun-loss diff later
+            prev_fleets[eid] = list(obs.get("fleets") or [])
             env_actions = {}
             for seat in range(n_players):
                 hist = histories[(eid, seat)]
@@ -266,18 +278,21 @@ def _vec_rollout_worker(task: dict) -> dict:
         _, rewards, dones = env.step(actions_batch)
         steps_taken += 1
 
-        # PBRS per (eid, train_seat)
+        # PBRS per (eid, train_seat) — production/ship potentials + sun-loss
+        # penalty + comet-window multiplier + per-step clip.
+        in_comet = (steps_taken in COMET_WIN)
         for eid in range(n_envs):
             if env.done_mask[eid]:
                 continue
+            cur_obs = env.get_obs_dict(eid)
+            cur_pl  = cur_obs["planets"]
+            cur_fl  = cur_obs["fleets"]
+            tot_sh  = sum(p[5] for p in cur_pl) + sum(f[6] for f in cur_fl)
+            tot_pr  = max(1, sum(p[6] for p in cur_pl))
+            cur_fids = {int(f[0]) for f in cur_fl}
             for seat in train_seats[eid]:
                 if not seat_samples[(eid, seat)]:
                     continue
-                cur_obs = env.get_obs_dict(eid)
-                cur_pl  = cur_obs["planets"]
-                cur_fl  = cur_obs["fleets"]
-                tot_sh  = sum(p[5] for p in cur_pl) + sum(f[6] for f in cur_fl)
-                tot_pr  = max(1, sum(p[6] for p in cur_pl))
                 my_pr   = sum(p[6] for p in cur_pl if p[1] == seat)
                 my_sh   = (sum(p[5] for p in cur_pl if p[1] == seat)
                            + sum(f[6] for f in cur_fl if f[1] == seat))
@@ -287,9 +302,22 @@ def _vec_rollout_worker(task: dict) -> dict:
                 ship_phi = my_sh / max(1, tot_sh)
                 en_phi   = en_sh / max(1, tot_sh)
                 pp = prev_phi[(eid, seat)]
-                r = ((prod_phi - GAMMA * pp["prod_phi"])
+
+                # Sun-loss: this seat's fleets present last step, gone now,
+                # and last seen near the sun → counted as sun-killed.
+                sun_lost = 0
+                for f in prev_fleets[eid]:
+                    if int(f[1]) != seat or int(f[0]) in cur_fids:
+                        continue
+                    if math.hypot(f[2] - SUN_CENTER, f[3] - SUN_CENTER) < SUN_DEATH_RADIUS:
+                        sun_lost += int(f[6])
+
+                comet_mult = COMET_PROD_MULT if in_comet else 1.0
+                r = (comet_mult * (prod_phi - GAMMA * pp["prod_phi"])
                      + 0.5 * (ship_phi - GAMMA * pp["ship_phi"])
-                     - 0.3 * (en_phi   - GAMMA * pp["enemy_ship_phi"]))
+                     - 0.3 * (en_phi   - GAMMA * pp["enemy_ship_phi"])
+                     - SUN_PENALTY * sun_lost / 100.0)
+                r = max(-PBRS_CLIP, min(PBRS_CLIP, r))
                 seat_samples[(eid, seat)][-1]["reward"] = r
                 prev_phi[(eid, seat)] = {"prod_phi": prod_phi, "ship_phi": ship_phi,
                                           "enemy_ship_phi": en_phi}
@@ -477,7 +505,8 @@ def _samples_to_td(samples):
 
 def ppo_update(net, opt, all_samples, device,
                ppo_epochs=4, mini_batch=256, clip=0.2,
-               val_clip=0.2, val_coef=0.5, ent_coef=0.01):
+               val_clip=0.2, val_coef=0.5, ent_coef=0.01,
+               bc_loader=None, bc_weight=0.0):
     if not all_samples:
         return {}
     full = _samples_to_td(all_samples)
@@ -496,7 +525,13 @@ def ppo_update(net, opt, all_samples, device,
     n_per_ep = max(1, math.ceil(T / min(mini_batch, T)))
     total = ppo_epochs * n_per_ep
     info = {"pi_loss": 0.0, "v_loss": 0.0, "ent": 0.0,
-            "ratio_mean": 0.0, "ratio_max": 0.0, "n": 0}
+            "ratio_mean": 0.0, "ratio_max": 0.0, "n": 0,
+            "bc_mode_ce": 0.0, "bc_frac_ce": 0.0,
+            "bc_mode_acc": 0.0, "bc_frac_acc": 0.0, "bc_n": 0}
+
+    use_bc = bc_loader is not None and bc_weight > 0.0
+    if use_bc:
+        from training.bc_aux_loss import compute_bc_loss
 
     for _ in range(total):
         mini = buf.sample().to(device)
@@ -514,6 +549,16 @@ def ppo_update(net, opt, all_samples, device,
         v_loss  = torch.max((v_new - vt) ** 2, (v_clip_ - vt) ** 2).mean()
         loss = pi_loss + val_coef * v_loss - ent_coef * ent.mean()
 
+        if use_bc:
+            bc_batch = bc_loader.sample()
+            bc_loss, bc_info = compute_bc_loss(net, bc_batch)
+            loss = loss + bc_weight * bc_loss
+            info["bc_mode_ce"]  += bc_info["mode_ce"]
+            info["bc_frac_ce"]  += bc_info["frac_ce"]
+            info["bc_mode_acc"] += bc_info["mode_acc"]
+            info["bc_frac_acc"] += bc_info["frac_acc"]
+            info["bc_n"]        += 1
+
         opt.zero_grad(); loss.backward()
         nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         opt.step()
@@ -528,6 +573,10 @@ def ppo_update(net, opt, all_samples, device,
     n = max(1, info["n"])
     for k in ("pi_loss", "v_loss", "ent", "ratio_mean"):
         info[k] /= n
+    if info["bc_n"] > 0:
+        nbc = info["bc_n"]
+        for k in ("bc_mode_ce", "bc_frac_ce", "bc_mode_acc", "bc_frac_acc"):
+            info[k] /= nbc
     info["T"] = T
     return info
 
@@ -566,6 +615,14 @@ def main():
     ap.add_argument("--four-player-prob",   type=float, default=0.2)
     ap.add_argument("--start-iter",         type=int, default=1)
     ap.add_argument("--out",                required=True)
+    ap.add_argument("--bc-data-dir",        default=None,
+                    help="Directory of bc_*.npz shards from build_bc_dataset.py. "
+                         "If set, BC aux loss runs alongside PPO each minibatch.")
+    ap.add_argument("--bc-weight",          type=float, default=0.1,
+                    help="Multiplier on BC loss in total = pi + val*v - ent + bc_weight*bc.")
+    ap.add_argument("--bc-batch-size",      type=int, default=64)
+    ap.add_argument("--bc-winners-only",    action="store_true",
+                    help="Restrict BC supervision to winning expert seats.")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -587,6 +644,20 @@ def main():
                         pfsp_p=args.pfsp_p,
                         pfsp_floor=args.pfsp_floor,
                         ema_alpha=args.pfsp_ema_alpha)
+
+    bc_loader = None
+    if args.bc_data_dir:
+        from training.bc_aux_loss import BCLoader
+        bc_loader = BCLoader(
+            args.bc_data_dir,
+            batch_size=args.bc_batch_size,
+            device=device,
+            winners_only=args.bc_winners_only,
+            seed=42,
+        )
+        print(f"[k14-vec] BC aux: data={args.bc_data_dir}  "
+              f"weight={args.bc_weight}  batch={args.bc_batch_size}  "
+              f"winners_only={args.bc_winners_only}", flush=True)
 
     def sdb():
         buf = io.BytesIO()
@@ -645,7 +716,8 @@ def main():
         ent_c = args.ent_coef_start + alpha * (args.ent_coef_end - args.ent_coef_start)
         info = ppo_update(net, opt, all_samples, device,
                           ppo_epochs=args.ppo_epochs, mini_batch=args.mini_batch,
-                          clip=args.clip, val_coef=args.val_coef, ent_coef=ent_c)
+                          clip=args.clip, val_coef=args.val_coef, ent_coef=ent_c,
+                          bc_loader=bc_loader, bc_weight=args.bc_weight)
 
         if iter_ % args.snapshot_every == 0:
             pool.add(sdb(), f"iter{iter_:04d}")
@@ -657,6 +729,10 @@ def main():
         noise_now = _current_noise(iter_, args.lb_start_iter,
                                    args.noise_end_iter, args.noise_start_prob)
         pfsp_str = pool.stats(top_k=3)
+        bc_str = ""
+        if info.get("bc_n", 0) > 0:
+            bc_str = (f"  bc_m={info['bc_mode_ce']:.2f}/{info['bc_mode_acc']:.2f}"
+                      f"  bc_f={info['bc_frac_ce']:.2f}/{info['bc_frac_acc']:.2f}")
         print(
             f"[iter {iter_:05d}]  "
             f"wins={wins}/{tg}  ({opp_str})  "
@@ -667,7 +743,7 @@ def main():
             f"ent_c={ent_c:.3f}  pool={len(pool)}  "
             f"hardest=[{pfsp_str}]  "
             f"lb_noise={noise_now:.2f}  "
-            f"mc=[{mc_str}]  fc=[{fc_str}]  [{elapsed:.0f}s]",
+            f"mc=[{mc_str}]  fc=[{fc_str}]{bc_str}  [{elapsed:.0f}s]",
             flush=True,
         )
 

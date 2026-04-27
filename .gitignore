@@ -30,6 +30,9 @@ training/checkpoints/
 # Training + benchmark logs (run-local, not shared)
 training/logs/
 
+# BC dataset shards (regenerated from trajectories/<date>/<time>/)
+training/bc_data/
+
 # Kaggle artefacts
 orbit-wars.zip
 orbit-wars-kit.tar.gz*
