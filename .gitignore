@@ -13,6 +13,12 @@ training/checkpoints/
 .cron_expiry
 .cron_python
 
+# Windows scrape task runtime state
+.scrape_cron.log
+.scrape_cron.log.*
+.scrape_cron.lock
+.scrape_cron_expiry
+
 # Scheduler state
 .scheduler.log
 .scheduler.stdout
