@@ -593,8 +593,12 @@ def main():
     ap.add_argument("--ppo-epochs",         type=int, default=4)
     ap.add_argument("--mini-batch",         type=int, default=256)
     ap.add_argument("--lr",                 type=float, default=3e-4)
-    ap.add_argument("--ent-coef-start",     type=float, default=0.05)
-    ap.add_argument("--ent-coef-end",       type=float, default=0.01)
+    # Tom rl10 Fix #8: positive entropy bonus + WR<50% causes entropy creep
+    # (bad decisions → more losses → more entropy → worse decisions). Default
+    # is neutral start, small penalty end. Pass --ent-coef-start 0.05 to
+    # restore the old "encourage exploration" behaviour.
+    ap.add_argument("--ent-coef-start",     type=float, default=0.0)
+    ap.add_argument("--ent-coef-end",       type=float, default=-0.005)
     ap.add_argument("--ent-decay-iters",    type=int, default=100)
     ap.add_argument("--clip",               type=float, default=0.2)
     ap.add_argument("--val-coef",           type=float, default=0.5)

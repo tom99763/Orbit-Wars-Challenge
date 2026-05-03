@@ -107,7 +107,16 @@ class DualStreamK13Agent(nn.Module):
         from training.physics_action_helper_k13 import CAND_FEAT_DIM
         self.target_head = nn.Linear(d_entity + CAND_FEAT_DIM, 1)
 
-    def forward(self, planets, planet_mask, fleets, fleet_mask, globals_, spatial):
+    def forward(self, planets, planet_mask, fleets, fleet_mask, globals_, spatial,
+                value_detached: bool = False):
+        """Forward pass.
+
+        value_detached: when True, the value-head input is detached from the
+        backbone so v_loss can't propagate gradients past value_head. This is
+        Tom's rl10 Fix #2 — preventing V loss from corrupting backbone repr
+        and causing entropy explosion. Set True at training time (eval_batch)
+        and leave False at rollout (no_grad anyway, so moot).
+        """
         B, P, _ = planets.shape
         p_tok = self.planet_embed(planets) + self.type_embed.weight[0]
         f_tok = self.fleet_embed(fleets) + self.type_embed.weight[1]
@@ -127,7 +136,8 @@ class DualStreamK13Agent(nn.Module):
         )
         fused_planet_tokens = planet_tokens + fused_g.unsqueeze(1)
         mode_logits = self.mode_head(fused_planet_tokens)   # [B, P, 5]
-        value = self.value_head(fused_g).squeeze(-1)
+        value_input = fused_g.detach() if value_detached else fused_g
+        value = self.value_head(value_input).squeeze(-1)
         # NOTE: frac_logits NOT computed here — call frac_logits_for(fused, mode_idx)
         # to get [*, N_FRACS] conditioned on chosen mode.
         return fused_planet_tokens, mode_logits, value

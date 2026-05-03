@@ -236,13 +236,17 @@ def eval_batch(net, batch_td: dict, device: str):
 
     B, MAX_P, _ = planets.shape
 
-    # Forward
+    # Forward — `value_detached=True` per Tom rl10 Fix #2: v_loss only
+    # updates value_head, not the backbone. Without this, V gradient
+    # corrupts the backbone representation and causes entropy explosion
+    # (Tom: "21 extra gradient updates per PPO step from V loss alone").
     fused_tokens, mode_logits, value = net(
         planets, planet_mask, fleets, fleet_mask, globals_, spatial,
+        value_detached=True,
     )
     # fused_tokens: [B, MAX_P, d_entity]
     # mode_logits:  [B, MAX_P, N_MODES]
-    # value:        [B]
+    # value:        [B]   ← gradient flows only into value_head
 
     # ── Mode log_prob ─────────────────────────────────────────────────────────
     masked_mode = mode_logits + (1.0 - mode_mask) * (-1e9)
