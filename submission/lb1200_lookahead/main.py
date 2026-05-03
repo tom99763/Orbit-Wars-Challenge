@@ -1,5 +1,5 @@
 # Auto-generated Kaggle submission — lb-1200 + shallow lookahead.
-# Do not edit directly. Regenerate via training/build_submission_lookahead.sh.
+# Do NOT edit directly. Regenerate via training/build_submission_lookahead.py.
 
 import math
 import time
@@ -31,7 +31,18 @@ TOTAL_WAR_REMAINING_TURNS = 38
 
 SAFE_NEUTRAL_MARGIN = 2
 CONTESTED_NEUTRAL_MARGIN = 2
-INTERCEPT_TOLERANCE = 1
+INTERCEPT_TOLERANCE = 1   # default for static planets
+
+def _tol_for(target, initial_by_id, comet_ids):
+    """Exact tolerance (0) for moving targets, loose (1) for static."""
+    if target.id in comet_ids:
+        return 0
+    init = initial_by_id.get(target.id)
+    if init is None:
+        return INTERCEPT_TOLERANCE
+    import math as _math
+    r = _math.sqrt((init.x - 50.0)**2 + (init.y - 50.0)**2)
+    return 0 if r + init.radius < ROTATION_LIMIT else INTERCEPT_TOLERANCE
 
 SAFE_OPENING_PROD_THRESHOLD = 4
 SAFE_OPENING_TURN_LIMIT = 10
@@ -347,6 +358,7 @@ def target_can_move(target, initial_by_id, comet_ids):
 
 
 def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, comet_ids):
+    tol = _tol_for(target, initial_by_id, comet_ids)
     best = None
     best_score = None
     max_turns = min(HORIZON, ROUTE_SEARCH_HORIZON)
@@ -363,7 +375,7 @@ def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, co
         if est is None:
             continue
         _, turns = est
-        if abs(turns - candidate_turns) > INTERCEPT_TOLERANCE:
+        if abs(turns - candidate_turns) > tol:
             continue
 
         actual_turns = max(turns, candidate_turns)
@@ -380,7 +392,7 @@ def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, co
             continue
 
         delta = abs(confirm[1] - actual_turns)
-        if delta > INTERCEPT_TOLERANCE:
+        if delta > tol:
             continue
 
         score = (delta, confirm[1], candidate_turns)
@@ -392,6 +404,7 @@ def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, co
 
 
 def aim_with_prediction(src, target, ships, initial_by_id, ang_vel, comets, comet_ids):
+    tol = _tol_for(target, initial_by_id, comet_ids)
     est = estimate_arrival(src.x, src.y, src.radius, target.x, target.y, target.radius, ships)
     if est is None:
         if not target_can_move(target, initial_by_id, comet_ids):
@@ -401,7 +414,7 @@ def aim_with_prediction(src, target, ships, initial_by_id, ang_vel, comets, come
         )
 
     tx, ty = target.x, target.y
-    for _ in range(5):
+    for _ in range(12):
         _, turns = est
         pos = predict_target_position(target, turns, initial_by_id, ang_vel, comets, comet_ids)
         if pos is None:
@@ -415,20 +428,18 @@ def aim_with_prediction(src, target, ships, initial_by_id, ang_vel, comets, come
                 src, target, ships, initial_by_id, ang_vel, comets, comet_ids,
             )
         if (
-            abs(ntx - tx) < 0.3
-            and abs(nty - ty) < 0.3
-            and abs(next_est[1] - turns) <= INTERCEPT_TOLERANCE
+            abs(ntx - tx) < 0.1
+            and abs(nty - ty) < 0.1
+            and abs(next_est[1] - turns) <= tol
         ):
             return next_est[0], next_est[1], ntx, nty
         tx, ty = ntx, nty
         est = next_est
 
-    final_est = estimate_arrival(src.x, src.y, src.radius, tx, ty, target.radius, ships)
-    if final_est is None:
-        return search_safe_intercept(
-            src, target, ships, initial_by_id, ang_vel, comets, comet_ids,
-        )
-    return final_est[0], final_est[1], tx, ty
+    # Refinement did not converge — fall back to exhaustive intercept search
+    return search_safe_intercept(
+        src, target, ships, initial_by_id, ang_vel, comets, comet_ids,
+    )
 
 # ============================================================
 # World Model
@@ -3055,15 +3066,27 @@ from typing import Any, Sequence
 
 
 # Default scoring horizon — balances lookahead depth vs compute.
-# Shorter than lb-1200's internal SIM_HORIZON=110 because we score variants
-# many times per turn.
-LOOKAHEAD_HORIZON = 30
+# Bumped from 30 → 50: 30 steps was 1/16 of a 500-step game and missed the
+# capture-then-defend cascades that take 40+ turns to play out. Time budget
+# guard already truncates per-variant scoring if we run long.
+LOOKAHEAD_HORIZON = 50
 
 # Weights for scoring function:
 W_MY_SHIPS = 1.0       # my total ships at horizon
 W_MY_PLANETS = 30.0    # my planet count at horizon (each worth ~30 ships)
+W_MY_PRODUCTION = 50.0 # NEW: my owned production at horizon — high-prod
+                       # planets are more valuable than low-prod ones, the
+                       # original W_MY_PLANETS=30 treated them all equal.
 W_ENEMY_SHIPS = -0.5   # penalize enemy ships
+W_ENEMY_PRODUCTION = -25.0  # NEW: penalize enemy production (mirror)
 W_RISK = -20.0         # penalize each of our planets predicted to fall
+
+# Comet windows: ±5 turns around each spawn step. Capturing a comet during
+# its window grants free production for the rest of the game, so my_ships
+# and my_planets at horizon are worth more if we're inside a window now.
+COMET_SPAWN_STEPS = (50, 150, 250, 350, 450)
+COMET_WIN = {s + d for s in COMET_SPAWN_STEPS for d in range(-5, 6)}
+COMET_BONUS_MULT = 1.5  # multiply my-side scoring while in window
 
 
 def _infer_target_planet(src, angle: float, planets):
@@ -3116,28 +3139,32 @@ def _compute_arrivals(world, action_list, include_existing=True):
     return arrivals
 
 
-def _score_action_set(world, action_list, horizon=LOOKAHEAD_HORIZON):
+def _score_action_set(world, action_list, horizon=LOOKAHEAD_HORIZON, step=0):
     """Score an action set by predicted ship/planet outcome at horizon.
 
     Higher is better. Considers:
       - My total ships on owned planets at horizon (W_MY_SHIPS)
       - My planet count at horizon (W_MY_PLANETS)
+      - My total production at horizon (W_MY_PRODUCTION)  — NEW
       - Enemy ships on owned planets (W_ENEMY_SHIPS)
+      - Enemy total production (W_ENEMY_PRODUCTION)  — NEW
       - Risk: planets expected to fall to enemies (W_RISK)
+      - Comet bonus: my-side terms scaled by COMET_BONUS_MULT during
+        comet spawn windows (capturing comets = free long-term production).
     """
     arrivals = _compute_arrivals(world, action_list, include_existing=True)
     me = world.player
 
     my_ships = 0.0
     my_planets = 0
+    my_production = 0.0
     enemy_ships = 0.0
+    enemy_production = 0.0
     fallen_planets = 0
 
     for planet in world.planets:
         plan_arrivals = arrivals.get(planet.id, [])
         timeline_info = simulate_planet_timeline(planet, plan_arrivals, me, horizon)
-        # lb-1200's simulate_planet_timeline returns a dict:
-        #   {"owner_at": {turn:owner}, "ships_at": {turn:ships}, ...}
         owner_at = timeline_info.get("owner_at", {})
         ships_at = timeline_info.get("ships_at", {})
         final_owner = owner_at.get(horizon, planet.owner)
@@ -3146,22 +3173,29 @@ def _score_action_set(world, action_list, horizon=LOOKAHEAD_HORIZON):
         if final_owner == me:
             my_ships += final_ships
             my_planets += 1
-            # If this was ours and is now ours, but dipped below zero in between,
-            # that's a risk — simplify by checking min across path
+            my_production += planet.production
         elif final_owner != -1:
             enemy_ships += final_ships
+            enemy_production += planet.production
 
         # Risk: our planet this turn, lost at horizon
         if planet.owner == me and final_owner != me:
             fallen_planets += 1
 
-    score = (W_MY_SHIPS * my_ships
-             + W_MY_PLANETS * my_planets
+    in_comet = (step in COMET_WIN)
+    my_mult = COMET_BONUS_MULT if in_comet else 1.0
+
+    score = (my_mult * (W_MY_SHIPS * my_ships
+                        + W_MY_PLANETS * my_planets
+                        + W_MY_PRODUCTION * my_production)
              + W_ENEMY_SHIPS * enemy_ships
+             + W_ENEMY_PRODUCTION * enemy_production
              + W_RISK * fallen_planets)
     return score, {
         "my_ships": my_ships, "my_planets": my_planets,
-        "enemy_ships": enemy_ships, "fallen": fallen_planets,
+        "my_prod": my_production,
+        "enemy_ships": enemy_ships, "enemy_prod": enemy_production,
+        "fallen": fallen_planets, "comet_bonus": in_comet,
     }
 
 
@@ -3174,6 +3208,13 @@ def _generate_variants(primary: list, world) -> list[list]:
       V2: same actions, each reduced to 50% of ships
       V3: drop the lowest-priority single action (one with smallest ships)
       V4: no actions (pass this turn)
+      V5 (NEW): drop the highest-priority single action — sometimes the
+                "obvious" big move is over-committing; let the simulation
+                check whether holding back the largest fleet is actually
+                better. Mirror to V3.
+      V6 (NEW): drop two weakest actions if available — a "minimal
+                action" variant. Catches cases where lb1200 wants to do
+                3 things but only 1 is critical.
     """
     variants = [list(primary)]  # V0
     if not primary:
@@ -3193,6 +3234,18 @@ def _generate_variants(primary: list, world) -> list[list]:
         variants.append(v3)
     # V4: pass
     variants.append([])
+    # V5: drop strongest — counter-intuitive but the biggest move can be
+    # the most over-committal one
+    if len(primary) >= 2:
+        strongest_idx = max(range(len(primary)), key=lambda i: primary[i][2])
+        v5 = [m for i, m in enumerate(primary) if i != strongest_idx]
+        variants.append(v5)
+    # V6: drop two weakest (only if we have ≥3 actions to start with)
+    if len(primary) >= 3:
+        sorted_idx = sorted(range(len(primary)), key=lambda i: primary[i][2])
+        drop = set(sorted_idx[:2])
+        v6 = [m for i, m in enumerate(primary) if i not in drop]
+        variants.append(v6)
 
     return variants
 
@@ -3229,7 +3282,10 @@ def agent(obs, config=None):
     # 3. Generate variants
     variants = _generate_variants(primary, world)
 
-    # 4. Score each within budget
+    # 4. Score each within budget — pass current step so comet bonus
+    #    triggers when we're inside a window
+    step = int(obs.get("step", 0) or 0) if isinstance(obs, dict) \
+           else int(getattr(obs, "step", 0) or 0)
     deadline = start_time + act_timeout * 0.9
     best_score = -float("inf")
     best_action = primary
@@ -3237,7 +3293,7 @@ def agent(obs, config=None):
         if time.perf_counter() > deadline:
             break
         try:
-            score, _ = _score_action_set(world, v, horizon=LOOKAHEAD_HORIZON)
+            score, _ = _score_action_set(world, v, horizon=LOOKAHEAD_HORIZON, step=step)
         except Exception:
             continue
         if score > best_score:
