@@ -363,34 +363,55 @@ def _vec_rollout_worker(task: dict) -> dict:
 # Opponent pool
 # ──────────────────────────────────────────────────────────────────────────────
 class OpponentPool:
-    """League pool with PFSP sampling and adaptive eviction.
+    """League pool with PFSP sampling, adaptive eviction, and frozen-anchor
+    ELO bookkeeping (per AlphaStar / CLAUDE-2.md `simple_rl_v2`).
 
     Per-snapshot win-rate (EMA) drives two policies:
       sampling — pick HARD opponents more often: w_i ∝ (1 − win_rate_i)^p + floor
       eviction — drop the EASIEST mature snapshot when pool is full
 
-    `record_result(idx, won)` must be called for every game played against a
-    pool snapshot; idx is the value returned by the matching `sample_index()`.
-    Indices are stable within an iteration (no add() runs while rollouts are
-    in flight), so the round-trip task → result is safe.
+    Frozen-anchor ELO: each pool entry stores `snapshot_elo[i]` = the
+    learner's ELO at the moment that snapshot was frozen. Anchor ELOs
+    NEVER update. The learner has a single `learner_elo` (default 1500)
+    that updates via standard Elo (K factor `elo_k`) on every game played
+    against a pool entry. Because snapshot ELOs are immutable and new
+    snapshots are added at the learner's current ELO, this produces the
+    monotonically-rising "purple→cyan" curve described in the AlphaStar
+    league/elo_learner plot — provided the learner is genuinely improving.
+
+    `record_result(idx, won)` must be called for every game played against
+    a pool snapshot; idx is the value returned by the matching
+    `sample_index()`. It updates BOTH the EMA win-rate (for PFSP +
+    eviction) AND the learner's ELO (against the snapshot's frozen ELO).
+
+    Indices are stable within an iteration (no add() runs while rollouts
+    are in flight), so the round-trip task → result is safe.
     """
 
     def __init__(self, max_size: int = 20, pfsp_p: float = 2.0,
-                 pfsp_floor: float = 0.05, ema_alpha: float = 0.15):
+                 pfsp_floor: float = 0.05, ema_alpha: float = 0.15,
+                 elo_init: float = 1500.0, elo_k: float = 16.0):
         self.snapshots: list[bytes] = []
         self.tags:      list[str]   = []
         self.win_ema:   list[float] = []   # EMA of P(we beat snapshot i), in [0, 1]
         self.games:     list[int]   = []   # raw count for confidence / eviction grace
+        self.snapshot_elo: list[float] = []  # FROZEN at add() time, never updates
         self.max_size  = max_size
         self.pfsp_p    = pfsp_p
         self.pfsp_floor = pfsp_floor
         self.ema_alpha = ema_alpha
+        # Learner state — single mutable ELO updated only by record_result()
+        self.learner_elo = float(elo_init)
+        self.elo_k       = float(elo_k)
+        self.elo_games   = 0   # total games used for ELO updates (any anchor)
 
     def add(self, sd_bytes: bytes, tag: str) -> None:
+        """Snapshot current learner with its current ELO (frozen forever)."""
         self.snapshots.append(sd_bytes)
         self.tags.append(tag)
         self.win_ema.append(0.5)        # neutral prior — sampled often until proven easy
         self.games.append(0)
+        self.snapshot_elo.append(self.learner_elo)
         if len(self.snapshots) > self.max_size:
             # Drop the snapshot we've beaten most (least informative training signal).
             # Protect entries with < min_games games so fresh additions get a chance.
@@ -398,7 +419,8 @@ class OpponentPool:
             mature = [i for i, g in enumerate(self.games) if g >= min_games]
             drop = (max(mature, key=lambda i: self.win_ema[i])
                     if mature else 0)   # FIFO fallback when nothing mature
-            for arr in (self.snapshots, self.tags, self.win_ema, self.games):
+            for arr in (self.snapshots, self.tags, self.win_ema, self.games,
+                        self.snapshot_elo):
                 arr.pop(drop)
 
     def __len__(self) -> int:
@@ -417,11 +439,23 @@ class OpponentPool:
         return random.choices(range(n), weights=weights, k=1)[0]
 
     def record_result(self, idx: int, won: bool) -> None:
+        """Record one game outcome against snapshot `idx`.
+
+        Updates:
+          - PFSP/eviction state: win_ema, games count
+          - ELO: learner_elo only (snapshot's elo is frozen)
+        """
         if not (0 <= idx < len(self.snapshots)):
             return
         x = 1.0 if won else 0.0
+        # PFSP + eviction tracking
         self.win_ema[idx] = (1.0 - self.ema_alpha) * self.win_ema[idx] + self.ema_alpha * x
         self.games[idx] += 1
+        # Frozen-anchor Elo update — only learner_elo moves
+        opp_elo = self.snapshot_elo[idx]
+        expected = 1.0 / (1.0 + 10.0 ** ((opp_elo - self.learner_elo) / 400.0))
+        self.learner_elo += self.elo_k * (x - expected)
+        self.elo_games += 1
 
     def stats(self, top_k: int = 3) -> str:
         """Short summary of the K hardest snapshots (lowest win-rate against them)."""
@@ -432,6 +466,15 @@ class OpponentPool:
             f"{self.tags[i]}={self.win_ema[i]:.2f}({self.games[i]})"
             for i in order[:top_k]
         )
+
+    def elo_summary(self) -> str:
+        """Compact ELO line: learner ELO + range across pool snapshots."""
+        if not self.snapshot_elo:
+            return f"learner={self.learner_elo:.0f}"
+        lo = min(self.snapshot_elo)
+        hi = max(self.snapshot_elo)
+        return (f"learner={self.learner_elo:.0f} "
+                f"pool_elo=[{lo:.0f}..{hi:.0f}] elo_games={self.elo_games}")
 
 
 def _current_noise(iter_, lb_start, noise_end, noise_start) -> float:
@@ -627,6 +670,9 @@ def main():
     ap.add_argument("--bc-batch-size",      type=int, default=64)
     ap.add_argument("--bc-winners-only",    action="store_true",
                     help="Restrict BC supervision to winning expert seats.")
+    # Frozen-anchor ELO (CLAUDE-2.md / simple_rl_v2 league mechanism)
+    ap.add_argument("--elo-init",           type=float, default=1500.0)
+    ap.add_argument("--elo-k",              type=float, default=16.0)
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -647,7 +693,9 @@ def main():
     pool = OpponentPool(max_size=args.pool_size,
                         pfsp_p=args.pfsp_p,
                         pfsp_floor=args.pfsp_floor,
-                        ema_alpha=args.pfsp_ema_alpha)
+                        ema_alpha=args.pfsp_ema_alpha,
+                        elo_init=args.elo_init,
+                        elo_k=args.elo_k)
 
     bc_loader = None
     if args.bc_data_dir:
@@ -737,6 +785,9 @@ def main():
         if info.get("bc_n", 0) > 0:
             bc_str = (f"  bc_m={info['bc_mode_ce']:.2f}/{info['bc_mode_acc']:.2f}"
                       f"  bc_f={info['bc_frac_ce']:.2f}/{info['bc_frac_acc']:.2f}")
+        # Frozen-anchor ELO: learner ELO + games used for updates this run
+        elo_str = (f"  learner_elo={pool.learner_elo:.1f}"
+                   f"  elo_games={pool.elo_games}")
         print(
             f"[iter {iter_:05d}]  "
             f"wins={wins}/{tg}  ({opp_str})  "
@@ -747,7 +798,7 @@ def main():
             f"ent_c={ent_c:.3f}  pool={len(pool)}  "
             f"hardest=[{pfsp_str}]  "
             f"lb_noise={noise_now:.2f}  "
-            f"mc=[{mc_str}]  fc=[{fc_str}]{bc_str}  [{elapsed:.0f}s]",
+            f"mc=[{mc_str}]  fc=[{fc_str}]{bc_str}{elo_str}  [{elapsed:.0f}s]",
             flush=True,
         )
 
