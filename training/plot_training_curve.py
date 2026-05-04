@@ -95,6 +95,10 @@ def parse_log(path: pathlib.Path) -> list[IterRow]:
         for line in f:
             if "[iter " not in line:
                 continue
+            # Skip "[iter NNNNN] saved …" lines emitted at checkpoint boundaries
+            # — they reuse the iter prefix but lack the metric fields.
+            if "saved" in line and "wins=" not in line:
+                continue
             it_str = _grab(line, "iter")
             if it_str is None:
                 continue
