@@ -354,6 +354,41 @@ def compute_gae(
 
 
 # ---------------------------------------------------------------------------
+# Adaptive Gradient Clipping (NFNets-style, per-tensor)
+# ---------------------------------------------------------------------------
+
+def adaptive_grad_clip_(
+    parameters,
+    clip_factor: float = 0.1,
+    eps: float = 1e-3,
+) -> None:
+    """In-place per-tensor adaptive gradient clipping (Brock et al. 2021).
+
+    For each parameter tensor with a gradient:
+        max_grad_norm = clip_factor * ||p||
+        if ||p.grad|| > max_grad_norm:
+            p.grad *= max_grad_norm / ||p.grad||
+
+    CLAUDE-2.md notes the NFNets default clip_factor=0.01 was TOO TIGHT for
+    a 0.05M-parameter model — gnorm was getting pinned at the threshold and
+    effective LR dropped near zero. 0.1 was the sweet spot in their ablation.
+
+    Compared to torch's clip_grad_norm_ (one global norm), this fights
+    pathological per-tensor gradient explosion (a single bad weight blowing
+    up doesn't get to drag the rest of the model with it).
+    """
+    for p in parameters:
+        if p.grad is None:
+            continue
+        param_norm = p.detach().norm().clamp(min=eps)
+        grad_norm  = p.grad.norm()
+        max_grad_norm = clip_factor * param_norm
+        # clip_coef = min(1, max_grad_norm / grad_norm)
+        clip_coef = (max_grad_norm / grad_norm.clamp(min=1e-6)).clamp(max=1.0)
+        p.grad.mul_(clip_coef)
+
+
+# ---------------------------------------------------------------------------
 # PPO update
 # ---------------------------------------------------------------------------
 
@@ -371,6 +406,8 @@ def ppo_update(
       - Mnih value clipping (CLIP_VF)
       - Entropy bonus (ENT_COEF)
       - Batch-level advantage normalization (NOT per-minibatch)
+      - approx-KL early stop at args.target_kl × 1.5 (rl10 fix)
+      - AGC per-tensor gradient clipping (rl10 fix) when args.use_agc
     """
     # Flatten T × N → single batch dim
     flat = {}
@@ -394,10 +431,12 @@ def ppo_update(
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
     flat["advantages"] = adv
 
-    info = {"pi_loss": 0.0, "v_loss": 0.0, "ent": 0.0, "n": 0}
+    info = {"pi_loss": 0.0, "v_loss": 0.0, "ent": 0.0, "kl": 0.0,
+            "n": 0, "epochs_done": 0, "kl_stopped": False}
 
     for epoch in range(args.ppo_epochs):
         idx = torch.randperm(n_total)
+        epoch_kls = []
         for s in range(0, n_total, args.minibatch_size):
             mb_idx = idx[s:s + args.minibatch_size]
             pf  = flat["pf"][mb_idx].to(device)
@@ -431,19 +470,44 @@ def ppo_update(
 
             ent = policy_entropy(joint, src_mask).mean()
 
+            # Approx KL (Schulman et al., http://joschu.net/blog/kl-approx.html)
+            # Use the unbiased k3 estimator: KL ≈ ((ratio - 1) - log(ratio)).mean()
+            # Always >= 0; less variance than 0.5*(lp_diff)^2.
+            with torch.no_grad():
+                lp_diff = new_lp - old_lp
+                approx_kl = (ratio - 1.0 - lp_diff).mean().clamp(min=0.0).item()
+            epoch_kls.append(approx_kl)
+
             loss = pi_loss + args.vf_coef * v_loss - args.ent_coef * ent
             optim.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            if args.use_agc:
+                adaptive_grad_clip_(
+                    model.parameters(),
+                    clip_factor=args.agc_factor,
+                )
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optim.step()
 
             info["pi_loss"] += pi_loss.item()
             info["v_loss"]  += v_loss.item()
             info["ent"]     += ent.item()
+            info["kl"]      += approx_kl
             info["n"]       += 1
 
+        info["epochs_done"] += 1
+        # KL early stop: if this epoch's mean approx-KL exceeded the
+        # threshold, skip remaining PPO epochs (the policy moved enough
+        # already; further updates risk over-shooting the trust region).
+        if args.use_kl_stop and len(epoch_kls) > 0:
+            mean_kl = sum(epoch_kls) / len(epoch_kls)
+            if mean_kl > args.target_kl * 1.5:
+                info["kl_stopped"] = True
+                break
+
     if info["n"] > 0:
-        for k in ("pi_loss", "v_loss", "ent"):
+        for k in ("pi_loss", "v_loss", "ent", "kl"):
             info[k] /= info["n"]
     return info
 
@@ -467,7 +531,21 @@ def main() -> int:
     ap.add_argument("--lr",             type=float, default=5e-4)
     ap.add_argument("--ppo-epochs",     type=int, default=4)
     ap.add_argument("--minibatch-size", type=int, default=1024)
-    ap.add_argument("--max-grad-norm",  type=float, default=1.0)
+    ap.add_argument("--max-grad-norm",  type=float, default=1.0,
+                    help="Used only when --no-agc; otherwise per-tensor AGC.")
+    # rl10 fixes (CLAUDE-2.md). On by default — run01 was the no-fix baseline.
+    ap.add_argument("--use-agc",        type=int, default=1,
+                    help="1 = NFNets-style per-tensor adaptive grad clipping "
+                         "(rl10 Fix #7-style). 0 = global clip_grad_norm_.")
+    ap.add_argument("--agc-factor",     type=float, default=0.1,
+                    help="Per-tensor clip ratio: max_grad_norm = factor·||p||. "
+                         "CLAUDE-2.md notes 0.01 (NFNets default) is too tight "
+                         "for tiny models — 0.1 was their sweet spot.")
+    ap.add_argument("--use-kl-stop",    type=int, default=1,
+                    help="1 = stop further PPO epochs once mean approx-KL "
+                         "in an epoch exceeds 1.5·target_kl.")
+    ap.add_argument("--target-kl",      type=float, default=0.015,
+                    help="KL early-stop threshold (CLAUDE-2.md default).")
     ap.add_argument("--snapshot-every", type=int, default=50)
     ap.add_argument("--pool-size",      type=int, default=16)
     ap.add_argument("--latest-prob",    type=float, default=0.3)
@@ -572,6 +650,10 @@ def main() -> int:
         term_mask_all = roll["done"] & (roll["reward"].abs() > 0.5)
         all_wins   = int(((roll["reward"] > 0) & term_mask_all).sum().item())
         all_total  = int(term_mask_all.sum().item())
+        kl_tag = f"kl={info.get('kl', 0):.4f}"
+        kl_tag += f"@{info.get('epochs_done', 0)}/{args.ppo_epochs}"
+        if info.get("kl_stopped", False):
+            kl_tag += "*"
         line = (f"[iter {upd:05d}]  "
                 f"wins={all_wins}/{max(1, all_total)}  "
                 f"(elo_opp={'self' if opp_idx < 0 else league.entries[opp_idx].tag if opp_idx < len(league) else 'evicted'})  "
@@ -583,6 +665,7 @@ def main() -> int:
                 f"hardest=[{league.hardest_summary()}]  "
                 f"lb_noise=0.00  mc=[0 0 0 0 0]  fc=[0 0 0 0 0 0 0 0]  "
                 f"learner_elo={league.learner_elo:.1f}  elo_games={league.elo_games}  "
+                f"{kl_tag}  "
                 f"[{int(elapsed)}s]")
         print(line, flush=True)
         with log_path.open("a", encoding="utf-8") as f:
