@@ -655,13 +655,13 @@ def main():
         s_idx = buf["s_idx"].reshape(T * 2 * n_envs_int, JAX_MAX_PLANETS)
         old_lp = buf["lp"].reshape(-1)
 
-        # Single PPO update on whole batch (1 epoch, 1 minibatch for speed)
-        # Value warmup: first 30 upd only update V (policy frozen — let V converge first)
-        # Value warmup — 30 upd of V-only. Tutorial skips this (small batch +
-        # 4 epoch lets V catch up fast). We have 4096 batch + 2 epoch — V
-        # alone needs a head start, else advantages stay noisy and policy
-        # collapses on noise. Re-enabled after observing repeated NOOP-crash.
-        value_only = upd < 30
+        # V-only warmup removed (2026-05-13): LR warmup_cosine already ramps
+        # LR from 0 over 10% of training, which gives V time to catch up while
+        # simultaneously starving policy gradients of magnitude. The earlier
+        # 30-upd V-only gate was a workaround for constant-LR NOOP-crash;
+        # LR warmup makes it redundant and counter-productive (V's LR also
+        # near-zero during V-only window).
+        value_only = False
         # ent_coef = 0.10 — modest exploration pressure. Bigger ent_coef can't
         # save us when masks are heavy (softmax already degenerate); rely on
         # PBRS + relaxed MIN_SHIPS to keep mask non-degenerate.
