@@ -58,6 +58,12 @@ EXPERIMENTS = [
 ]
 
 
+def _find_latest_ckpt(save_dir: Path):
+    """Return path to the latest full checkpoint (.ckpt.pkl), or None."""
+    ckpts = sorted((save_dir / "snapshots").glob("*.ckpt.pkl")) if (save_dir / "snapshots").exists() else []
+    return ckpts[-1] if ckpts else None
+
+
 def _train_proc(save_dir: Path, env_extras: Dict[str, str],
                 n_envs: int, t_rollout: int, total_updates: int):
     env = dict(os.environ)
@@ -70,8 +76,13 @@ def _train_proc(save_dir: Path, env_extras: Dict[str, str],
         "--total-updates", str(total_updates),
         "--save-dir", str(save_dir),
     ]
+    # Auto-resume from latest full checkpoint if one exists
+    latest_ckpt = _find_latest_ckpt(save_dir)
+    if latest_ckpt:
+        cmd += ["--resume", str(latest_ckpt)]
+        print(f"  [resume] found checkpoint {latest_ckpt.name} — passing --resume", flush=True)
     log_path = save_dir / "run.log"
-    with open(log_path, "w") as f:
+    with open(log_path, "a") as f:  # append so prior log is preserved on resume
         proc = subprocess.Popen(cmd, env=env, stdout=f, stderr=subprocess.STDOUT,
                                   cwd="/home/lab/orbit-war")
     return proc
