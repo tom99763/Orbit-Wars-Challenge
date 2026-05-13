@@ -301,14 +301,14 @@ def main():
     base.mkdir(parents=True, exist_ok=True)
     all_results = []
 
-    # Filter EXPERIMENTS by --experiments / --skip
+    # Filter EXPERIMENTS by --experiments / --skip; preserve --experiments order.
     selected = EXPERIMENTS
     if args.experiments:
-        names_wanted = set(args.experiments)
-        unknown = names_wanted - {n for n, _, _ in EXPERIMENTS}
+        unknown = set(args.experiments) - {n for n, _, _ in EXPERIMENTS}
         if unknown:
             print(f"[runner] WARN: unknown experiment names {unknown}", flush=True)
-        selected = [(n, d, e) for n, d, e in EXPERIMENTS if n in names_wanted]
+        by_name = {n: (n, d, e) for n, d, e in EXPERIMENTS}
+        selected = [by_name[n] for n in args.experiments if n in by_name]
     if args.skip:
         selected = [(n, d, e) for n, d, e in selected if n not in args.skip]
     print(f"[runner] Running {len(selected)} experiment(s): {[n for n, _, _ in selected]}", flush=True)
