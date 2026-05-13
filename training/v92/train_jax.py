@@ -425,15 +425,23 @@ def main():
     state_batch = pristine_state  # restore — only the compile cache should persist
     print(f"[init] compile took {time.time()-t0:.1f}s", flush=True)
 
-    # Optimizer with LR warmup + cosine decay
-    def make_lr_schedule(peak: float, warmup: int, total: int):
-        def fn(step):
-            warmup_lr = peak * jnp.minimum(step / warmup, 1.0)
-            progress = jnp.maximum(0.0, (step - warmup) / max(1, total - warmup))
-            cosine = peak * 0.5 * (1 + jnp.cos(jnp.pi * jnp.minimum(progress, 1.0)))
-            return jnp.where(step < warmup, warmup_lr, cosine)
-        return fn
-    lr_schedule = optax.constant_schedule(3e-4)  # tutorial-aligned constant LR (was 7.5e-5 warmup+cosine; NOOP-collapsed)
+    # LR warmup + cosine decay (opt-step granularity).
+    # PPO_EPOCHS × n_mb opt steps per upd; total_updates known here.
+    _n_mb_per_upd = max(1, (args.t_rollout * 2 * args.n_envs) // MINIBATCH_SIZE)
+    _opt_steps_per_upd = PPO_EPOCHS * _n_mb_per_upd
+    _total_opt_steps = args.total_updates * _opt_steps_per_upd
+    _warmup_opt_steps = int(0.1 * _total_opt_steps)  # 10% warmup
+    _peak_lr = 3e-4
+    _end_lr = _peak_lr * 0.1  # cosine end = 10% of peak
+    lr_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=_peak_lr,
+        warmup_steps=_warmup_opt_steps,
+        decay_steps=_total_opt_steps,
+        end_value=_end_lr,
+    )
+    print(f"[init] LR schedule: warmup {_warmup_opt_steps}/{_total_opt_steps} opt-steps "
+          f"(peak={_peak_lr:.0e}, end={_end_lr:.0e})", flush=True)
     optimizer = optax.chain(
         optax.clip_by_global_norm(0.5),
         optax.adam(learning_rate=lr_schedule),
