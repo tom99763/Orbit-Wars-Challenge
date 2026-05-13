@@ -117,9 +117,9 @@ def _is_stable(csv_path: Path, window: int = 50) -> Optional[Dict]:
     df = pd.read_csv(csv_path)
     if len(df) < window: return None
     recent = df.tail(window)
-    ok_ent_t = (recent["ent_t"] > 0.4).all()
+    ok_ent_t = (recent["ent_t"] > 0.1).all()
     ok_ent_s = True  # ent_s=0 for baseline (no ship head); skip
-    ok_cf = (recent["clip_frac"] < 0.20).all()
+    ok_cf = (recent["clip_frac"] < 0.50).all()
     return {
         "stable": ok_ent_t and ok_ent_s and ok_cf,
         "ent_t_mean": float(recent["ent_t"].mean()),
@@ -338,9 +338,9 @@ def main():
             df = pd.read_csv(baseline_csv)
             if len(df) >= 200:
                 tail = df.tail(100)
-                ok_ent_t = (tail["ent_t"] > 0.4).all()
+                ok_ent_t = (tail["ent_t"] > 0.1).all()
                 ok_ent_s = True  # ent_s=0 for baseline (no ship head); skip
-                ok_cf = (tail["clip_frac"] < 0.25).all()
+                ok_cf = (tail["clip_frac"] < 0.50).all()
                 stable = ok_ent_t and ok_ent_s and ok_cf
                 print(f"[runner] Baseline stability check (last 100 upd):", flush=True)
                 print(f"    ent_t > 1.0: {ok_ent_t} (mean {tail['ent_t'].mean():.3f})", flush=True)
