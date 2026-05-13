@@ -425,23 +425,8 @@ def main():
     state_batch = pristine_state  # restore — only the compile cache should persist
     print(f"[init] compile took {time.time()-t0:.1f}s", flush=True)
 
-    # LR warmup + cosine decay (opt-step granularity).
-    # PPO_EPOCHS × n_mb opt steps per upd; total_updates known here.
-    _n_mb_per_upd = max(1, (args.t_rollout * 2 * args.n_envs) // MINIBATCH_SIZE)
-    _opt_steps_per_upd = PPO_EPOCHS * _n_mb_per_upd
-    _total_opt_steps = args.total_updates * _opt_steps_per_upd
-    _warmup_opt_steps = int(0.1 * _total_opt_steps)  # 10% warmup
-    _peak_lr = 3e-4
-    _end_lr = _peak_lr * 0.1  # cosine end = 10% of peak
-    lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=_peak_lr,
-        warmup_steps=_warmup_opt_steps,
-        decay_steps=_total_opt_steps,
-        end_value=_end_lr,
-    )
-    print(f"[init] LR schedule: warmup {_warmup_opt_steps}/{_total_opt_steps} opt-steps "
-          f"(peak={_peak_lr:.0e}, end={_end_lr:.0e})", flush=True)
+    lr_schedule = optax.constant_schedule(3e-4)
+    print(f"[init] LR schedule: constant 3e-4", flush=True)
     optimizer = optax.chain(
         optax.clip_by_global_norm(0.5),
         optax.adam(learning_rate=lr_schedule),
