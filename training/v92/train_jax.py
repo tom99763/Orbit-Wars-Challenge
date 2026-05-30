@@ -24,7 +24,21 @@ from training.v92.policy_jax import V92PolicyJAX, TargetHead, ShipHead, init_pol
 from training.v92.ppo_jax import make_ppo_update, compute_gae
 import optax
 from training.v92.features import PLANET_FEAT_DIM, FLEET_FEAT_DIM, GLOBAL_FEAT_DIM, N_SHIP_BUCKETS, SHIP_FRACS
-from training.v92.bias_config import BIAS_PBRS, active_biases
+from training.v92.bias_config import (
+    BIAS_PBRS,
+    BIAS_PROD_SHARE, PROD_SHARE_ALPHA,
+    BIAS_SHIP_SHARE, SHIP_SHARE_ALPHA,
+    BIAS_PLANET_COUNT_SHARE, PLANET_COUNT_SHARE_ALPHA,
+    BIAS_FLEET_SHARE, FLEET_SHARE_ALPHA,
+    BIAS_RICH_PLANET_SHARE, RICH_PLANET_SHARE_ALPHA,
+    BIAS_EXP_RATIO_REWARD, EXP_RATIO_ALPHA,
+    BIAS_SIGMOID_GAP_REWARD, SIGMOID_GAP_ALPHA, SIGMOID_GAP_BETA,
+    ZEROSUM_VALUE, GAMMA,
+    TEACHER_KL, TEACHER_CKPT,
+    TEACHER_KL_COEF0, TEACHER_KL_FINAL,
+    TEACHER_VALUE_COEF0, TEACHER_VALUE_FINAL, TEACHER_ANNEAL_UPD,
+    active_biases,
+)
 # Tutorial-aligned fix for gradient-flatness without sacrificing too much SPS:
 # - PBRS disabled (force-on Φ=ships made policy learn DON'T FIRE because
 #   firing temporarily drops my_ships before fleet lands → negative shaped
@@ -358,6 +372,98 @@ def collect_rollout_jax(state_batch, body_params, th_params, sh_params, key,
     }
 
 
+def _eval_vs_last_best(body, target_head, ship_head, cur, lb, n_games, seed0):
+    """JAX-vs-JAX, FULLY VECTORIZED: all n_games run concurrently in a vmap'd env
+    batch and are stepped in lockstep via lax.scan (argmax/deterministic, both
+    seats). cur plays seat0 in one batch and seat1 in another (seat-balanced).
+    Returns cur's win rate.
+
+    This replaces the old per-game/per-step Python loop (6 games × 500 steps × 2
+    JAX dispatches = ~6000 sequential CPU↔GPU round-trips → 13-20 min). Now it is
+    one jitted scan per seat-assignment → seconds. Mirrors the materialization of
+    `make_rollout_step_snapshot.build_act` but with argmax instead of sampling.
+
+    env_jax.step has no auto-reset and 'once done stays done' (terminal rewards
+    are frozen via jnp.where), so scanning EPISODE_STEPS+1 steps leaves every game
+    holding its terminal reward. last_best never enters rollout (pure self-play),
+    so this only feeds the promotion metric — a small estimate error is harmless."""
+    from training.v92.bias_config import USE_SHIP_HEAD as _USE, BIAS_REQ_SHIPS as _REQ
+    _ship_fracs = jnp.array(SHIP_FRACS, dtype=jnp.float32)
+    MIN_SHIPS = 10; MAX_SPEED = 6.0; LN1000 = math.log(1000.0)
+
+    def _act_one(bp, tp, sp, pf, pm, ff, fm, gf, own, sun, st):
+        n = pf.shape[0]
+        p_h, _ = body.apply(bp, pf, pm, ff, fm, gf)
+        tgt_logits = target_head.apply(tp, p_h, p_h, pm, sun)            # (n,S,T+1)
+        t_idx = jnp.argmax(tgt_logits, axis=-1).reshape(-1)             # argmax
+        if _USE:
+            s_idx = jnp.argmax(ship_head.apply(sp, p_h.reshape(-1, p_h.shape[-1])), axis=-1)
+        else:
+            s_idx = jnp.zeros_like(t_idx)
+        own_flat = own.reshape(-1)
+        t_idx = jnp.where(own_flat, t_idx, JAX_MAX_PLANETS).reshape(n, JAX_MAX_PLANETS)
+        s_idx = jnp.where(own_flat, s_idx, 0).reshape(n, JAX_MAX_PLANETS)
+        valid_t = t_idx < JAX_MAX_PLANETS
+        valid = (valid_t & (s_idx != 0)) if _USE else valid_t
+        src = jnp.arange(JAX_MAX_PLANETS, dtype=jnp.float32)[None, :].repeat(n, axis=0)
+        src = jnp.where(valid, src, -1)
+        cur_pos = jax.vmap(_planet_pos_at_step)(st, jnp.maximum(st.step - 1, 0))
+        tgt_safe = jnp.clip(t_idx, 0, JAX_MAX_PLANETS - 1)
+        tgt_x = jnp.take_along_axis(cur_pos[:, :, 0], tgt_safe, axis=1)
+        tgt_y = jnp.take_along_axis(cur_pos[:, :, 1], tgt_safe, axis=1)
+        angle = jnp.arctan2(tgt_y - cur_pos[:, :, 1], tgt_x - cur_pos[:, :, 0])
+        if _USE:
+            frac = _ship_fracs[s_idx]
+            ships = jnp.maximum(1, (st.planet_ships.astype(jnp.float32) * frac).astype(jnp.int32))
+            ships = jnp.minimum(ships, st.planet_ships)
+        else:
+            tgt_ships = jnp.take_along_axis(st.planet_ships, tgt_safe, axis=1)
+            base = jnp.maximum(tgt_ships + 1, MIN_SHIPS).astype(jnp.float32)
+            if _REQ:
+                dx = tgt_x - cur_pos[:, :, 0]; dy = tgt_y - cur_pos[:, :, 1]
+                dist = jnp.sqrt(dx * dx + dy * dy)
+                speed = jnp.minimum(1.0 + 5.0 * (jnp.log(jnp.maximum(base, 1.0)) / LN1000) ** 1.5, MAX_SPEED)
+                tick = jnp.floor(dist / jnp.maximum(speed, 0.1))
+                tgt_prod = jnp.take_along_axis(st.planet_prod, tgt_safe, axis=1).astype(jnp.float32)
+                needed = base + tick * tgt_prod
+            else:
+                needed = base
+            ships = jnp.minimum(st.planet_ships, jnp.maximum(needed, MIN_SHIPS).astype(jnp.int32))
+        ships = jnp.where(valid, ships, 0).astype(jnp.float32)
+        return jnp.stack([src, angle, ships], axis=-1)
+
+    @jax.jit
+    def _run(batch, ba, ta, sa, bb, tb, sb):
+        def step_fn(st, _):
+            n = st.planet_active.shape[0]
+            feats = featurize_jax_2seats(st)
+            def sp_(a): return a[:n], a[n:]
+            pf0, pf1 = sp_(feats["planet_feat"]); pm0, pm1 = sp_(feats["planet_mask"])
+            ff0, ff1 = sp_(feats["fleet_feat"]); fm0, fm1 = sp_(feats["fleet_mask"])
+            gf0, gf1 = sp_(feats["global_feat"]); own0, own1 = sp_(feats["own_mask"]); sun0, sun1 = sp_(feats["sun_block"])
+            a0 = _act_one(ba, ta, sa, pf0, pm0, ff0, fm0, gf0, own0, sun0, st)
+            a1 = _act_one(bb, tb, sb, pf1, pm1, ff1, fm1, gf1, own1, sun1, st)
+            new = step_batch(st, jnp.concatenate([a0, a1], axis=1))
+            # lax.scan requires an invariant carry dtype; step_batch promotes some
+            # int fields (e.g. planet_ships) to float32. The training loop tolerates
+            # this drift (plain Python loop, no type check); here we cast every leaf
+            # back to the carry's input dtype. Ships are whole numbers so int↔float
+            # is lossless, and the env accepted int32 input on the reset-state step.
+            new = jax.tree_util.tree_map(lambda n_, o_: n_.astype(o_.dtype), new, st)
+            return new, None
+        final, _ = jax.lax.scan(step_fn, batch, None, length=EPISODE_STEPS + 1)
+        return final.rewards                                            # (n_games, N_PLAYERS)
+
+    states = [reset_from_np(env_v3.reset(seed=seed0 + g * 7919, num_agents=2), jr.PRNGKey(seed0 + g))
+              for g in range(n_games)]
+    batch = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *states)
+    cb, ct, cs = cur; lb_b, lb_t, lb_s = lb
+    r0 = _run(batch, cb, ct, cs, lb_b, lb_t, lb_s)   # cur @ seat0
+    r1 = _run(batch, lb_b, lb_t, lb_s, cb, ct, cs)   # cur @ seat1
+    wins = int((r0[:, 0] > r0[:, 1]).sum()) + int((r1[:, 1] > r1[:, 0]).sum())
+    return wins / max(1, 2 * n_games)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-envs", type=int, default=128)  # 10K SPS GPU throughput target
@@ -368,7 +474,86 @@ def main():
     parser.add_argument("--resume", default=None,
                         help="Path to a full checkpoint (.ckpt.pkl) to resume from. "
                              "Restores params + opt_state + upd counter + PRNG key.")
+    # ── Lux-style hyperparameters. Defaults = legacy v92 (backward-compatible);
+    #    the Lux full-version launch passes the Lux values explicitly. ──
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr-end-factor", type=float, default=1.0,
+                        help="final LR = lr * this. 1.0 = constant (legacy).")
+    parser.add_argument("--lr-transition", type=int, default=0,
+                        help="linear-decay steps; 0 = constant schedule.")
+    parser.add_argument("--adam-eps", type=float, default=1e-8)
+    parser.add_argument("--clip-grad", type=float, default=0.5,
+                        help="global-norm grad clip (legacy 0.5; Lux 10.0).")
+    parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument("--minibatch-size", type=int, default=2048)
+    parser.add_argument("--ent-coef", type=float, default=0.10,
+                        help="entropy coef for BOTH heads (legacy 0.10; Lux 1e-4).")
+    parser.add_argument("--clip-coef", type=float, default=0.2)
+    parser.add_argument("--vf-coef", type=float, default=0.5)
+    parser.add_argument("--eval-every", type=int, default=1000,
+                        help="run opponent-eval + last_best gate every N updates "
+                             "(was hardcoded 200; gate is now vectorized/fast, but the "
+                             "opponent-eval vs rule agents is still ~330s, so default 1000).")
+    parser.add_argument("--n-gpus", type=int, default=1,
+                        help="data-parallel across N GPUs via jax.sharding (default 1). "
+                             "Requires --n-envs divisible by N and CUDA_VISIBLE_DEVICES to "
+                             "expose ≥N devices. Env batch is sharded along axis 0; params "
+                             "+ opt_state + last_best are replicated. PPO minibatch gather "
+                             "triggers all-gather (small cost); rollout is the main win.")
+    parser.add_argument("--monitor-every", type=int, default=50,
+                        help="log CPU/RAM/GPU util every N updates to sys.csv + stdout. "
+                             "Set 0 to disable.")
     args = parser.parse_args()
+    EVAL_EVERY = args.eval_every
+
+    # ── Multi-GPU sharding (data-parallel via jax.sharding) ──────────────
+    n_gpus = max(1, args.n_gpus)
+    mesh = None
+    env_sharding = None
+    rep_sharding = None
+    if n_gpus > 1:
+        avail = jax.devices()
+        if len(avail) < n_gpus:
+            raise RuntimeError(
+                f"--n-gpus {n_gpus} but only {len(avail)} JAX devices visible. "
+                f"Set CUDA_VISIBLE_DEVICES to expose more (e.g. CUDA_VISIBLE_DEVICES=0,1).")
+        if args.n_envs % n_gpus != 0:
+            raise ValueError(
+                f"--n-envs ({args.n_envs}) must divide evenly by --n-gpus ({n_gpus}).")
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+        mesh = Mesh(np.array(avail[:n_gpus]), ("data",))
+        env_sharding = NamedSharding(mesh, P("data"))
+        rep_sharding = NamedSharding(mesh, P())
+        print(f"[init] Multi-GPU: data-parallel across {n_gpus} GPUs "
+              f"({[str(d) for d in avail[:n_gpus]]}); n_envs={args.n_envs} → "
+              f"{args.n_envs//n_gpus}/device. Params + opt_state + last_best replicated.",
+              flush=True)
+    else:
+        print(f"[init] Single-GPU on {jax.devices()[0]}", flush=True)
+
+    def _shard_env(x):
+        return jax.device_put(x, env_sharding) if env_sharding is not None else x
+
+    def _shard_rep(x):
+        return jax.device_put(x, rep_sharding) if rep_sharding is not None else x
+
+    def _shard_env_tree(t):
+        return jax.tree_util.tree_map(_shard_env, t)
+
+    def _shard_rep_tree(t):
+        return jax.tree_util.tree_map(_shard_rep, t)
+
+    # ── System monitor init (psutil + nvidia-smi) ────────────────────────
+    from training.v92 import sys_monitor as _sm
+    _ = _sm.query_sys()  # warm psutil cpu_percent (first call returns 0)
+    _initial_gpus = _sm.query_gpus()
+    _n_gpu_log = max(1, len(_initial_gpus))
+    if args.monitor_every > 0:
+        print(f"[init] sys-monitor ON: log every {args.monitor_every} upd, "
+              f"detected {len(_initial_gpus)} physical GPU(s), "
+              f"writing → save_dir/sys.csv", flush=True)
+        print(f"[init] {_sm.format_brief({'sys': _sm.query_sys(), 'gpus': _initial_gpus})}",
+              flush=True)
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -380,6 +565,10 @@ def main():
                sum(p.size for p in jax.tree_util.tree_leaves(sh_p))
     print(f"[init] V92PolicyJAX {n_params:,} params", flush=True)
     print(f"[init] active biases: {active_biases()}", flush=True)
+    # Replicate params across devices (no-op in single-GPU mode).
+    body_p = _shard_rep_tree(body_p)
+    th_p   = _shard_rep_tree(th_p)
+    sh_p   = _shard_rep_tree(sh_p)
 
     ship_fracs = jnp.array(SHIP_FRACS, dtype=jnp.float32)
     # Always build BOTH rollout fns — pool activation chooses at runtime.
@@ -410,6 +599,7 @@ def main():
     # Init envs
     states = [reset_from_np(env_v3.reset(seed=1000+i+args.seed*1000), key) for i in range(args.n_envs)]
     state_batch = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *states)
+    state_batch = _shard_env_tree(state_batch)  # shard along n_envs axis (no-op single-GPU)
     print(f"[init] {args.n_envs} envs ready", flush=True)
 
     # Compile (continuous path — snap path compiles on first pool sample).
@@ -425,18 +615,61 @@ def main():
     state_batch = pristine_state  # restore — only the compile cache should persist
     print(f"[init] compile took {time.time()-t0:.1f}s", flush=True)
 
-    lr_schedule = optax.constant_schedule(3e-4)
-    print(f"[init] LR schedule: constant 3e-4", flush=True)
+    if args.lr_transition > 0 and args.lr_end_factor != 1.0:
+        lr_schedule = optax.linear_schedule(
+            init_value=args.lr,
+            end_value=args.lr * args.lr_end_factor,
+            transition_steps=args.lr_transition,
+        )
+        print(f"[init] LR: linear {args.lr:.1e}→{args.lr*args.lr_end_factor:.1e} over {args.lr_transition} steps", flush=True)
+    else:
+        lr_schedule = optax.constant_schedule(args.lr)
+        print(f"[init] LR: constant {args.lr:.1e}", flush=True)
     optimizer = optax.chain(
-        optax.clip_by_global_norm(0.5),
-        optax.adam(learning_rate=lr_schedule),
+        optax.clip_by_global_norm(args.clip_grad),
+        optax.adam(learning_rate=lr_schedule, eps=args.adam_eps),
     )
+    print(f"[init] clip_grad={args.clip_grad} adam_eps={args.adam_eps} ppo_epochs={args.ppo_epochs} "
+          f"minibatch={args.minibatch_size} ent_coef={args.ent_coef} vf_coef={args.vf_coef} clip_coef={args.clip_coef}", flush=True)
     opt_state = optimizer.init((body_p, th_p, sh_p))
-    ppo_step = make_ppo_update(body, target_head, ship_head, optimizer)
+    opt_state = _shard_rep_tree(opt_state)  # replicate Adam state across devices
+    # Teacher-KL: load frozen teacher-net (same V92Policy arch) once. Closed over
+    # in the jit; only the annealed kl/tv coefs vary per update.
+    teacher_params = None
+    if TEACHER_KL:
+        if not TEACHER_CKPT or not Path(TEACHER_CKPT).exists():
+            raise FileNotFoundError(
+                f"TEACHER_KL=1 but TEACHER_CKPT not found: {TEACHER_CKPT!r}. "
+                f"Run collect_teacher_data.py + train_teacher_bc.py first.")
+        import pickle as _pk
+        with open(TEACHER_CKPT, "rb") as _tf:
+            _tck = _pk.load(_tf)
+        teacher_params = (_tck["body"], _tck["th"], _tck["sh"])
+        print(f"[init] Teacher-KL: ON, loaded {TEACHER_CKPT} "
+              f"(kl {TEACHER_KL_COEF0}→{TEACHER_KL_FINAL}, tv {TEACHER_VALUE_COEF0}→{TEACHER_VALUE_FINAL} "
+              f"over {TEACHER_ANNEAL_UPD} upd)", flush=True)
+    ppo_step = make_ppo_update(body, target_head, ship_head, optimizer,
+                               zerosum=ZEROSUM_VALUE, teacher_params=teacher_params)
+    if ZEROSUM_VALUE:
+        print("[init] ZeroSum value head: ON (paired softmax win-prob return target)", flush=True)
+        # ZeroSum trains an anti-symmetric value (v_p1 = -v_p0). Sparse ±1 and
+        # sigmoid_gap are anti-symmetric (consistent); the *_SHARE / exp_ratio /
+        # PBRS dense rewards are NOT → value target becomes inconsistent. Warn.
+        _nonsym = [n for n, v in [
+            ("BIAS_PROD_SHARE", BIAS_PROD_SHARE), ("BIAS_SHIP_SHARE", BIAS_SHIP_SHARE),
+            ("BIAS_PLANET_COUNT_SHARE", BIAS_PLANET_COUNT_SHARE),
+            ("BIAS_FLEET_SHARE", BIAS_FLEET_SHARE), ("BIAS_RICH_PLANET_SHARE", BIAS_RICH_PLANET_SHARE),
+            ("BIAS_EXP_RATIO_REWARD", BIAS_EXP_RATIO_REWARD), ("BIAS_PBRS", BIAS_PBRS)] if v]
+        if _nonsym:
+            print(f"[WARN] ZEROSUM_VALUE + non-antisymmetric dense reward(s) {_nonsym}: "
+                  f"value target not zero-sum-consistent. Prefer sparse ±1 + sigmoid_gap.", flush=True)
 
     # ── Resume from full checkpoint ──
+    from training.v92.bias_config import LAST_BEST_GATE, LAST_BEST_WR
+    from training.v92.features import N_SHIP_BUCKETS as _N_SHIP_BUCKETS
     import pickle as _pickle
     start_upd = 0
+    _resumed_last_best = None
     if args.resume:
         resume_path = Path(args.resume)
         if not resume_path.exists():
@@ -452,7 +685,27 @@ def main():
         key     = ckpt["key"]
         start_upd = int(ckpt["upd"]) + 1
         total_env_steps = int(ckpt.get("total_env_steps", 0))
-        print(f"[resume] restored upd={start_upd-1}, continuing from upd {start_upd}", flush=True)
+        _resumed_last_best = ckpt.get("last_best", None)
+        # Guard against silently loading a mismatched-shape checkpoint.
+        _ck_meta = ckpt.get("meta", {})
+        if _ck_meta.get("n_ship_buckets", _N_SHIP_BUCKETS) != _N_SHIP_BUCKETS:
+            raise ValueError(
+                f"resume N_SHIP_BUCKETS mismatch: ckpt={_ck_meta.get('n_ship_buckets')} "
+                f"!= current={_N_SHIP_BUCKETS}. Set N_SHIP_BUCKETS to match the checkpoint.")
+        print(f"[resume] restored upd={start_upd-1}, continuing from upd {start_upd}"
+              + (" (+last_best)" if _resumed_last_best is not None else ""), flush=True)
+        # Re-apply shardings after loading from pickle (numpy/single-device by default).
+        body_p     = _shard_rep_tree(body_p)
+        th_p       = _shard_rep_tree(th_p)
+        sh_p       = _shard_rep_tree(sh_p)
+        opt_state  = _shard_rep_tree(opt_state)
+        if _resumed_last_best is not None:
+            _resumed_last_best = _shard_rep_tree(_resumed_last_best)
+
+    # last_best: frozen reference for the eval-only promotion gate (WR>LAST_BEST_WR).
+    # NEVER enters rollout. Restored on resume; else seeded from current params.
+    last_best = _resumed_last_best if _resumed_last_best is not None else (body_p, th_p, sh_p)
+    last_best = _shard_rep_tree(last_best)
 
     # CSV log
     log_path = save_dir / "train.csv"
@@ -463,7 +716,10 @@ def main():
 
     # Train end-to-end
     t_start = time.time()
-    total_env_steps = 0
+    # Keep the resumed env-step counter (set in the resume block); only reset to 0
+    # for a fresh run. Resetting it on resume would replay the same env reset-seed
+    # sequence (seed_i = ... + total_env_steps + i) instead of continuing.
+    total_env_steps = total_env_steps if args.resume else 0
     n_envs_int = args.n_envs
     for upd in range(start_upd, args.total_updates):
         t0 = time.time()
@@ -481,6 +737,7 @@ def main():
                 else:
                     new_states.append(jax.tree_util.tree_map(lambda x: x[i], state_batch))
             state_batch = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *new_states)
+            state_batch = _shard_env_tree(state_batch)  # re-shard after host rebuild
             if upd % 20 == 0 or n_reset > n_envs_int // 4:
                 print(f"  [reset] upd {upd}: reset {n_reset}/{n_envs_int} done envs", flush=True)
 
@@ -598,17 +855,129 @@ def main():
             # And zero Φ_next on every mid-chunk first_done — telescoping demands it.
             phi_p0_next = jnp.where(first_done, 0.0, phi_p0_next)
             phi_p1_next = jnp.where(first_done, 0.0, phi_p1_next)
-            gamma = 0.99
+            # PBRS discount MUST match the GAE gamma (Ng-1999 potential consistency).
+            gamma = GAMMA
             F_p0 = gamma * phi_p0_next - phi_p0
             F_p1 = gamma * phi_p1_next - phi_p1
             # PBRS only on valid rows; post-terminal rows must contribute 0
             r_p0 = jnp.where(valid_row, r_p0 + F_p0, 0.0)
             r_p1 = jnp.where(valid_row, r_p1 + F_p1, 0.0)
+        if BIAS_PROD_SHARE:
+            # Dense per-tick reward: α · seat_prod / total_prod.
+            # Share-normalized so per-tick sum across seats = α (bounded).
+            # Reuses buf["pf"]: ch 0 = is_mine (per-seat, active-masked),
+            # ch 4 = planet_prod (raw ∈ [1,5]). buf["pf"] is (T, 2N, MAX_P, PFD)
+            # with first N = P0-view, second N = P1-view.
+            pf_2N = buf["pf"]
+            is_mine_2N = pf_2N[..., 0]
+            prods_2N = pf_2N[..., 4]
+            my_prod_2N = (is_mine_2N * prods_2N).sum(axis=-1)
+            my_prod_p0 = my_prod_2N[:, :n_envs_int]
+            my_prod_p1 = my_prod_2N[:, n_envs_int:]
+            both_dead = (my_prod_p0 + my_prod_p1) < 1e-6
+            total_safe = jnp.where(both_dead, 1.0, my_prod_p0 + my_prod_p1)
+            share_p0 = jnp.where(both_dead, 0.5, my_prod_p0 / total_safe)
+            share_p1 = jnp.where(both_dead, 0.5, my_prod_p1 / total_safe)
+            r_p0 = jnp.where(valid_row, r_p0 + PROD_SHARE_ALPHA * share_p0, r_p0)
+            r_p1 = jnp.where(valid_row, r_p1 + PROD_SHARE_ALPHA * share_p1, r_p1)
+        if BIAS_SHIP_SHARE:
+            # buf["gf"] ch 1 = my_total / 500 (per-seat view), includes fleet ships.
+            gf_2N = buf["gf"]
+            m_p0 = gf_2N[:, :n_envs_int, 1]
+            m_p1 = gf_2N[:, n_envs_int:, 1]
+            both_zero = (m_p0 + m_p1) < 1e-6
+            total_safe = jnp.where(both_zero, 1.0, m_p0 + m_p1)
+            share_p0 = jnp.where(both_zero, 0.5, m_p0 / total_safe)
+            share_p1 = jnp.where(both_zero, 0.5, m_p1 / total_safe)
+            r_p0 = jnp.where(valid_row, r_p0 + SHIP_SHARE_ALPHA * share_p0, r_p0)
+            r_p1 = jnp.where(valid_row, r_p1 + SHIP_SHARE_ALPHA * share_p1, r_p1)
+        if BIAS_PLANET_COUNT_SHARE:
+            # buf["gf"] ch 3 = my planet count / 30 (per-seat view).
+            gf_2N = buf["gf"]
+            m_p0 = gf_2N[:, :n_envs_int, 3]
+            m_p1 = gf_2N[:, n_envs_int:, 3]
+            both_zero = (m_p0 + m_p1) < 1e-6
+            total_safe = jnp.where(both_zero, 1.0, m_p0 + m_p1)
+            share_p0 = jnp.where(both_zero, 0.5, m_p0 / total_safe)
+            share_p1 = jnp.where(both_zero, 0.5, m_p1 / total_safe)
+            r_p0 = jnp.where(valid_row, r_p0 + PLANET_COUNT_SHARE_ALPHA * share_p0, r_p0)
+            r_p1 = jnp.where(valid_row, r_p1 + PLANET_COUNT_SHARE_ALPHA * share_p1, r_p1)
+        if BIAS_FLEET_SHARE:
+            # buf["ff"] ch 0 = is_mine (per-seat, zeroed for inactive),
+            # ch 2 = ships/100. Sum over fleets to get per-seat fleet-ship total.
+            ff_2N = buf["ff"]
+            my_fleet_sum = (ff_2N[..., 0] * ff_2N[..., 2]).sum(axis=-1)
+            m_p0 = my_fleet_sum[:, :n_envs_int]
+            m_p1 = my_fleet_sum[:, n_envs_int:]
+            both_zero = (m_p0 + m_p1) < 1e-6
+            total_safe = jnp.where(both_zero, 1.0, m_p0 + m_p1)
+            share_p0 = jnp.where(both_zero, 0.5, m_p0 / total_safe)
+            share_p1 = jnp.where(both_zero, 0.5, m_p1 / total_safe)
+            r_p0 = jnp.where(valid_row, r_p0 + FLEET_SHARE_ALPHA * share_p0, r_p0)
+            r_p1 = jnp.where(valid_row, r_p1 + FLEET_SHARE_ALPHA * share_p1, r_p1)
+        if BIAS_RICH_PLANET_SHARE:
+            # Share of "rich" planets (prod >= 3) — quality-weighted territory.
+            # Reuses buf["pf"]: ch 0 = is_mine, ch 4 = planet_prod (raw).
+            pf_2N = buf["pf"]
+            is_mine_2N = pf_2N[..., 0]
+            is_rich = (pf_2N[..., 4] >= 3.0).astype(jnp.float32)
+            my_rich_2N = (is_mine_2N * is_rich).sum(axis=-1)
+            m_p0 = my_rich_2N[:, :n_envs_int]
+            m_p1 = my_rich_2N[:, n_envs_int:]
+            both_zero = (m_p0 + m_p1) < 1e-6
+            total_safe = jnp.where(both_zero, 1.0, m_p0 + m_p1)
+            share_p0 = jnp.where(both_zero, 0.5, m_p0 / total_safe)
+            share_p1 = jnp.where(both_zero, 0.5, m_p1 / total_safe)
+            r_p0 = jnp.where(valid_row, r_p0 + RICH_PLANET_SHARE_ALPHA * share_p0, r_p0)
+            r_p1 = jnp.where(valid_row, r_p1 + RICH_PLANET_SHARE_ALPHA * share_p1, r_p1)
+        if BIAS_EXP_RATIO_REWARD:
+            # Non-linear ratio reward (Lux-style Option 1): α·(exp(R−1)−exp(−1)),
+            # R = prod_share = my_prod/(my_prod+en_prod). Subtract the R→0 floor
+            # exp(−1) so a wiped-out seat gets ≈0, not a constant. Reuses buf["pf"]:
+            # ch0 = is_mine, ch4 = planet_prod (raw ∈ [1,5]).
+            pf_2N = buf["pf"]
+            my_prod_2N = (pf_2N[..., 0] * pf_2N[..., 4]).sum(axis=-1)
+            my_prod_p0 = my_prod_2N[:, :n_envs_int]
+            my_prod_p1 = my_prod_2N[:, n_envs_int:]
+            both_dead = (my_prod_p0 + my_prod_p1) < 1e-6
+            total_safe = jnp.where(both_dead, 1.0, my_prod_p0 + my_prod_p1)
+            R_p0 = jnp.where(both_dead, 0.5, my_prod_p0 / total_safe)
+            R_p1 = jnp.where(both_dead, 0.5, my_prod_p1 / total_safe)
+            floor = jnp.exp(-1.0)
+            d_p0 = EXP_RATIO_ALPHA * (jnp.exp(R_p0 - 1.0) - floor)
+            d_p1 = EXP_RATIO_ALPHA * (jnp.exp(R_p1 - 1.0) - floor)
+            r_p0 = jnp.where(valid_row, r_p0 + d_p0, r_p0)
+            r_p1 = jnp.where(valid_row, r_p1 + d_p1, r_p1)
+        if BIAS_SIGMOID_GAP_REWARD:
+            # Non-linear ratio reward (Lux-style Option 2): α·(sigmoid(β·Δ)−0.5),
+            # Δ = (my_prod − en_prod)/total_prod ∈ [−1,1]. Zero-centered →
+            # naturally zero-sum-shaped (d_p1 = −d_p0). Max gradient at ties.
+            pf_2N = buf["pf"]
+            my_prod_2N = (pf_2N[..., 0] * pf_2N[..., 4]).sum(axis=-1)
+            my_prod_p0 = my_prod_2N[:, :n_envs_int]
+            my_prod_p1 = my_prod_2N[:, n_envs_int:]
+            both_dead = (my_prod_p0 + my_prod_p1) < 1e-6
+            total_safe = jnp.where(both_dead, 1.0, my_prod_p0 + my_prod_p1)
+            delta_p0 = jnp.where(both_dead, 0.0, (my_prod_p0 - my_prod_p1) / total_safe)
+            d_p0 = SIGMOID_GAP_ALPHA * (jax.nn.sigmoid(SIGMOID_GAP_BETA * delta_p0) - 0.5)
+            r_p0 = jnp.where(valid_row, r_p0 + d_p0, r_p0)
+            r_p1 = jnp.where(valid_row, r_p1 - d_p0, r_p1)
         # Split values_2N: (T, N) for p0, (T, N) for p1
         v_p0 = values_2N[:, :n_envs_int]
         v_p1 = values_2N[:, n_envs_int:]
         lv_p0 = last_value_2N[:n_envs_int]
         lv_p1 = last_value_2N[n_envs_int:]
+        # ZeroSum value: build the per-row partner value (raw, frozen) BEFORE any
+        # transform, so the PPO loss can re-apply the same softmax coupling after
+        # the minibatch shuffle. v_partner_2N: first N rows (P0) get v_p1, next N
+        # rows (P1) get v_p0 — matches the (T,2N)→(T*2N,) flatten of pf/own/adv/ret.
+        v_partner_2N = jnp.concatenate([v_p1, v_p0], axis=1)
+        v_partner = v_partner_2N.reshape(-1)
+        if ZEROSUM_VALUE:
+            # Couple seats for the GAE baseline + bootstrap (pairing intact here,
+            # pre-shuffle): zs = 2·sigmoid(v_self − v_partner) − 1 ∈ [−1,1].
+            w0 = jax.nn.sigmoid(v_p0 - v_p1); v_p0 = 2.0 * w0 - 1.0; v_p1 = -v_p0
+            lw0 = jax.nn.sigmoid(lv_p0 - lv_p1); lv_p0 = 2.0 * lw0 - 1.0; lv_p1 = -lv_p0
         adv_p0, ret_p0 = compute_gae(r_p0, v_p0, dones, lv_p0)
         adv_p1, ret_p1 = compute_gae(r_p1, v_p1, dones, lv_p1)
         adv = jnp.concatenate([adv_p0, adv_p1], axis=1).reshape(-1)
@@ -640,6 +1009,31 @@ def main():
         s_idx = buf["s_idx"].reshape(T * 2 * n_envs_int, JAX_MAX_PLANETS)
         old_lp = buf["lp"].reshape(-1)
 
+        # ── Multi-GPU buffer handling ──────────────────────────────────
+        # After reshape (T,2N,...)→(T*2N,...), the sharded axis pattern is
+        # stride-sharded, which is unsafe for random-index gathers like
+        # pf[idx] in the PPO minibatch loop (idx is replicated, target rows
+        # may live on other devices). We collapse to replicated layout with
+        # ONE all-gather per update — small (~16k samples × feat ≈ 5-20 MB
+        # over PCIe), versus the alternative of 32 gathers per update (one
+        # per minibatch step). PPO then runs in "replicated-on-each-device"
+        # mode (each GPU computes the same gradient, no speedup but correct);
+        # further parallelization of PPO via sharded minibatches is a TODO.
+        if rep_sharding is not None:
+            pf       = _shard_rep(pf)
+            pm       = _shard_rep(pm)
+            ff       = _shard_rep(ff)
+            fm       = _shard_rep(fm)
+            gf       = _shard_rep(gf)
+            own      = _shard_rep(own)
+            sun_inv  = _shard_rep(sun_inv)
+            t_idx    = _shard_rep(t_idx)
+            s_idx    = _shard_rep(s_idx)
+            old_lp   = _shard_rep(old_lp)
+            adv      = _shard_rep(adv)
+            ret      = _shard_rep(ret)
+            v_partner = _shard_rep(v_partner)
+
         # V-only warmup removed (2026-05-13): LR warmup_cosine already ramps
         # LR from 0 over 10% of training, which gives V time to catch up while
         # simultaneously starving policy gradients of magnitude. The earlier
@@ -650,25 +1044,33 @@ def main():
         # ent_coef = 0.10 — modest exploration pressure. Bigger ent_coef can't
         # save us when masks are heavy (softmax already degenerate); rely on
         # PBRS + relaxed MIN_SHIPS to keep mask non-degenerate.
-        ent_t_coef = 0.10
-        ent_s_coef = 0.10
+        ent_t_coef = args.ent_coef
+        ent_s_coef = args.ent_coef
+        # Teacher coef anneal: linear COEF0→FINAL over TEACHER_ANNEAL_UPD upds.
+        if TEACHER_KL:
+            _tfrac = min(1.0, upd / max(1, TEACHER_ANNEAL_UPD))
+            kl_coef = TEACHER_KL_COEF0 + _tfrac * (TEACHER_KL_FINAL - TEACHER_KL_COEF0)
+            tv_coef = TEACHER_VALUE_COEF0 + _tfrac * (TEACHER_VALUE_FINAL - TEACHER_VALUE_COEF0)
+        else:
+            kl_coef = 0.0; tv_coef = 0.0
         # PPO_EPOCHS × minibatch loop — tutorial-style gradient density.
         # buf_size = T * 2 * n_envs (16384 by default). MINIBATCH_SIZE=2048 →
         # 8 minibatches per epoch × 4 epochs = 32 ppo_step calls.
         buf_size = T * 2 * n_envs_int
-        n_mb = max(1, buf_size // MINIBATCH_SIZE)
-        for epoch_i in range(PPO_EPOCHS):
+        n_mb = max(1, buf_size // args.minibatch_size)
+        for epoch_i in range(args.ppo_epochs):
             key, perm_key = jr.split(key)
             perm = jr.permutation(perm_key, buf_size)
             for mb_i in range(n_mb):
-                idx = perm[mb_i * MINIBATCH_SIZE : (mb_i + 1) * MINIBATCH_SIZE]
+                idx = perm[mb_i * args.minibatch_size : (mb_i + 1) * args.minibatch_size]
                 body_p, th_p, sh_p, opt_state, metrics = ppo_step(
                     body_p, th_p, sh_p, opt_state,
                     pf[idx], pm[idx], ff[idx], fm[idx], gf[idx], own[idx], sun_inv[idx],
-                    t_idx[idx], s_idx[idx], old_lp[idx], adv[idx], ret[idx],
+                    t_idx[idx], s_idx[idx], old_lp[idx], adv[idx], ret[idx], v_partner[idx],
                     jnp.float32(ent_t_coef), jnp.float32(ent_s_coef),
-                    jnp.float32(0.5), jnp.float32(0.2),
+                    jnp.float32(args.vf_coef), jnp.float32(args.clip_coef),
                     jnp.bool_(value_only),
+                    jnp.float32(kl_coef), jnp.float32(tv_coef),
                 )
         metrics["loss"].block_until_ready()
         dt_upd = time.time() - t0
@@ -681,7 +1083,8 @@ def main():
             print(f"[upd {upd:6d}] {dt_upd*1000:.0f}ms vo={int(value_only)} (fleets={n_fleets}) "
                   f"pg={metrics['pg_loss']:.4f} vf={metrics['vf_loss']:.4f} "
                   f"ent_t={metrics['ent_t']:.3f} ent_s={metrics['ent_s']:.3f} "
-                  f"kl={metrics['approx_kl']:+.4f} cf={metrics['clip_frac']:.3f} SPS={sps:.0f}", flush=True)
+                  f"kl={metrics['approx_kl']:+.4f} cf={metrics['clip_frac']:.3f} "
+                  f"tkl={float(metrics['kl_loss']):.3f} tv={float(metrics['tv_loss']):.3f} SPS={sps:.0f}", flush=True)
 
         with open(log_path, "a") as f:
             f.write(f"{upd},{float(metrics['pg_loss']):.6f},{float(metrics['vf_loss']):.6f},"
@@ -689,7 +1092,20 @@ def main():
                     f"{float(metrics['approx_kl']):.6f},{float(metrics['clip_frac']):.6f},"
                     f"{n_fleets},{sps:.1f},{wall:.1f}\n")
 
-        if upd > 0 and upd % 200 == 0:
+        # ── System monitor (psutil + nvidia-smi) ─────────────────────────
+        # Logs CPU/RAM/per-GPU VRAM+util to sys.csv. Hardware-utilization
+        # signal: if util_pct stays low and CPU is high, rollout is host-bound
+        # (consider raising n_envs / t_rollout); if VRAM is far below capacity,
+        # there's headroom to scale up.
+        if args.monitor_every > 0 and upd > 0 and upd % args.monitor_every == 0:
+            try:
+                _info = _sm.query_all()
+                _sm.write_csv_log(save_dir / "sys.csv", upd, _info, _n_gpu_log)
+                print(f"[sys upd {upd}] {_sm.format_brief(_info)}", flush=True)
+            except Exception as _e:
+                print(f"[sys upd {upd}] monitor failed: {_e}", flush=True)
+
+        if upd > 0 and upd % EVAL_EVERY == 0:
             import pickle
             from training.v92 import bias_config as _bc
             action_space = {
@@ -705,17 +1121,24 @@ def main():
                     "body": body_p, "th": th_p, "sh": sh_p, "upd": upd,
                     "action_space": action_space,
                 }, f)
-            # Full resume checkpoint: params + opt_state + key + upd
+            # Full resume checkpoint: params + opt_state + key + upd + last_best + meta.
+            # Atomic write (tmp → os.replace) so an interrupt mid-write can't corrupt it.
+            import os as _os
             ckpt_path = snap_dir / f"v92_jax_upd{upd:06d}.ckpt.pkl"
-            with open(ckpt_path, "wb") as f:
+            tmp_path = ckpt_path.with_suffix(".pkl.tmp")
+            with open(tmp_path, "wb") as f:
                 pickle.dump({
                     "body": body_p, "th": th_p, "sh": sh_p,
                     "opt_state": opt_state,
                     "key": key,
                     "upd": upd,
+                    "last_best": last_best,
                     "action_space": action_space,
                     "total_env_steps": total_env_steps,
+                    "meta": {"n_ship_buckets": _N_SHIP_BUCKETS,
+                             "active_biases": _bc.active_biases()},
                 }, f)
+            _os.replace(tmp_path, ckpt_path)
             print(f"[snap] saved → {snap_path} + {ckpt_path.name}", flush=True)
 
             # ── INLINE EVAL every 200 upd (replaces watcher subprocess) ──
@@ -747,6 +1170,22 @@ def main():
                     f.write(",".join(row) + "\n")
             except Exception as e:
                 print(f"  [eval] upd {upd} FAILED: {e}", flush=True)
+
+            # ── last_best promotion gate (eval-only; never enters rollout) ──
+            if LAST_BEST_GATE:
+                try:
+                    wr_lb = _eval_vs_last_best(
+                        body, target_head, ship_head,
+                        (body_p, th_p, sh_p), last_best,
+                        n_games=6, seed0=70000 + upd * 13)
+                    promoted = wr_lb > LAST_BEST_WR
+                    if promoted:
+                        last_best = (body_p, th_p, sh_p)
+                    print(f"  [gate] upd {upd}: WR vs last_best={wr_lb:.0%}"
+                          + (f"  → PROMOTED (>{LAST_BEST_WR:.0%})" if promoted else ""),
+                          flush=True)
+                except Exception as e:
+                    print(f"  [gate] upd {upd} FAILED: {e}", flush=True)
 
 
 if __name__ == "__main__":
